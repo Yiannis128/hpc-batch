@@ -1,0 +1,41 @@
+# hpc-batch job dispatch daemon.
+#
+# Install:  cp systemd/hpc-batch.service /etc/systemd/system/
+#           systemctl daemon-reload && systemctl enable --now hpc-batch
+#
+# Admin parameters are passed as arguments to hpc-batchd below.
+# After editing them: systemctl daemon-reload && systemctl reload hpc-batch
+# (reload re-execs the daemon in place -- running jobs are NOT killed).
+
+[Unit]
+Description=hpc-batch job dispatch daemon
+Documentation=https://github.com/yiannis/hpc-batch
+After=local-fs.target
+
+[Service]
+Type=simple
+# Adjust the path if hpc-batchd was installed elsewhere (e.g. via pipx).
+ExecStart=/usr/local/bin/hpc-batchd --max-lifetime 24h --admin-group wheel
+ExecReload=/bin/kill -HUP $MAINPID
+
+# The daemon manages its own cgroup subtree for jobs (cpuset + memory).
+Delegate=cpuset memory pids
+# Belt and braces: forbid swap for the whole subtree (daemon + all jobs).
+# The daemon also sets memory.swap.max=0 per job; swapping jobs would make
+# benchmark timings meaningless.
+MemorySwapMax=0
+# Only kill the daemon itself on stop/restart; jobs keep running and are
+# re-adopted when the daemon comes back.
+KillMode=process
+
+# /run/hpc-batch (socket) and /var/lib/hpc-batch (state + job output).
+RuntimeDirectory=hpc-batch
+RuntimeDirectoryPreserve=yes
+StateDirectory=hpc-batch
+
+Restart=on-failure
+RestartSec=2
+OOMScoreAdjust=-500
+
+[Install]
+WantedBy=multi-user.target

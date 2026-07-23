@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hpc-batch"
+version = "0.1.0"
+description = "Single-node FIFO batch job dispatcher with cgroup + NUMA isolation"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Yiannis Charalambous" }]
+classifiers = [
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Distributed Computing",
+]
+dependencies = []
+
+[project.scripts]
+dispatch = "hpc_batch.client:main"
+hpc-batchd = "hpc_batch.daemon:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["hpc_batch"]
+
+[tool.hatch.envs.default]
+dependencies = ["pytest"]
+
+[tool.hatch.envs.default.scripts]
+test = "pytest {args:tests}"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
