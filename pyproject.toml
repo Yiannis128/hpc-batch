@@ -7,7 +7,7 @@ name = "hpc-batch"
 version = "0.1.0"
 description = "Single-node FIFO batch job dispatcher with cgroup + NUMA isolation"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 authors = [{ name = "Yiannis Charalambous" }]
 classifiers = [
     "Operating System :: POSIX :: Linux",
