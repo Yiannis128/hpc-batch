@@ -63,8 +63,30 @@ class TestFormatTable:
 
 def _local(year, month, day, hour, minute, second=0):
     """Epoch seconds for a local wall-clock time, so the expected rendering is
-    the same whatever timezone the tests run in."""
-    return time.mktime((year, month, day, hour, minute, second, 0, 0, -1))
+    the same whatever timezone the tests run in.
+
+    The wall clock skips an hour where daylight saving starts, and a time
+    inside that gap does not exist locally: mktime quietly returns the
+    shifted one instead, so a test would assert against a clock reading it
+    never asked for. Reading the timestamp back catches that here, naming
+    the cause, rather than as a puzzling one-hour diff in the assertion.
+
+    An ambiguous time (the hour daylight saving repeats) needs no guard: both
+    candidates read back as the wall clock that was asked for, which is all
+    these tests render.
+    """
+    wanted = (year, month, day, hour, minute, second)
+    ts = time.mktime((*wanted, 0, 0, -1))
+    back = time.localtime(ts)
+    got = (back.tm_year, back.tm_mon, back.tm_mday,
+           back.tm_hour, back.tm_min, back.tm_sec)
+    if got != wanted:
+        raise ValueError(
+            f"{wanted} is not a real local time in {time.tzname}: it falls in "
+            f"a daylight-saving gap and moved to {got}. Pick a date away from "
+            "a daylight-saving change."
+        )
+    return ts
 
 
 class TestFormatTime:
@@ -90,6 +112,24 @@ class TestFormatTime:
         last_year = format_time(_local(2025, 6, 22, 17, 54), now)
         this_year = format_time(_local(2026, 6, 22, 17, 54), now)
         assert last_year != this_year
+
+
+class TestLocalHelper:
+    """The guard in `_local` protects every test above, so it is worth
+    knowing it fires rather than trusting that it would."""
+
+    def test_rejects_a_wall_clock_time_that_does_not_exist(self, monkeypatch):
+        monkeypatch.setenv("TZ", "America/New_York")
+        time.tzset()
+        try:
+            # 2026-03-08: the clocks go 01:59 -> 03:00, so 02:30 never happens.
+            with pytest.raises(ValueError, match="daylight-saving gap"):
+                _local(2026, 3, 8, 2, 30)
+            # An hour either side of the gap is a real time and is accepted.
+            assert _local(2026, 3, 8, 1, 30) < _local(2026, 3, 8, 3, 30)
+        finally:
+            monkeypatch.undo()
+            time.tzset()
 
 
 class TestFormatGb:
