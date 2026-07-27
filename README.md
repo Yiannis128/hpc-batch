@@ -24,6 +24,13 @@ and benchmark timings are stable.
   `/dev/hpc-batch/jobs/<id>` (a symlink to its state directory) containing
   `info.json` (metadata) and `output` (combined stdout/stderr). Entries are
   owned by the submitting user with the admin group as group owner.
+- **Output you keep**: when a job finishes, its combined stdout/stderr is
+  copied to `output.<id>.log` in the directory you submitted from, so your
+  results live on your own storage and outlive anything the daemon prunes.
+  `--output` picks a different directory or filename, `--no-output` opts
+  out. The destination is checked for writability at submit time, so a bad
+  path is rejected immediately rather than after the job has run, and the
+  copy is written as *you*, never as root.
 - **Authentication**: the daemon identifies clients by `SO_PEERCRED` on the
   unix socket, so users cannot impersonate each other. Jobs are executed
   under the submitting user's uid/gid with a clean environment.
@@ -35,16 +42,61 @@ and benchmark timings are stable.
 
 ## Install
 
+Needs Python >= 3.10, cgroups v2, and root (systemd) for the daemon. The
+whole sequence, copy/paste:
+
 ```sh
-hatch build
-pip install dist/hpc_batch-*.whl            # as root, or pipx install for a system tool
-cp systemd/hpc-batch.service /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now hpc-batch
+# 1. Source, and build a wheel as a normal user (not root, so no
+#    root-owned build artifacts end up in the checkout).
+git clone https://github.com/Yiannis128/hpc-batch.git ~/projects/hpc-batch
+cd ~/projects/hpc-batch
+rm -rf dist
+python3 -m venv /tmp/hb-build
+/tmp/hb-build/bin/pip wheel -q --no-deps -w dist .
+
+# 2. Install into a dedicated venv and expose both entry points.
+sudo python3 -m venv /opt/hpc-batch
+sudo /opt/hpc-batch/bin/pip install -q dist/hpc_batch-*.whl
+sudo ln -sf /opt/hpc-batch/bin/dispatch   /usr/local/bin/dispatch
+sudo ln -sf /opt/hpc-batch/bin/hpc-batchd /usr/local/bin/hpc-batchd
+
+# 3. Install the unit. --admin-group must name a group that exists:
+#    "sudo" on Debian/Ubuntu, "wheel" on Fedora/RHEL (the shipped default).
+sudo cp systemd/hpc-batch.service /etc/systemd/system/
+sudo sed -i 's/--admin-group wheel/--admin-group sudo/' /etc/systemd/system/hpc-batch.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now hpc-batch
+
+# 4. Verify.
+systemctl status hpc-batch --no-pager
+dispatch new -- echo hello
+dispatch list --finished
 ```
 
-Adjust `ExecStart=` in the unit for the install location of `hpc-batchd`
-(e.g. `/usr/local/bin/hpc-batchd` or a pipx path).
+`/opt/hpc-batch` is world-readable, so every user on the machine can run
+`dispatch`. Do **not** install with `sudo pipx`: it puts the entry points in
+`/root/.local/bin` (mode 700), where `hpc-batchd` still works but no other
+user can run the client.
+
+Adjust the admin parameters on the `ExecStart=` line to taste (see
+[Admin configuration](#admin-configuration)); they are all daemon arguments.
+
+## Update
+
+```sh
+cd ~/projects/hpc-batch
+git pull
+rm -rf dist
+python3 -m venv /tmp/hb-build
+/tmp/hb-build/bin/pip wheel -q --no-deps -w dist .
+sudo /opt/hpc-batch/bin/pip install -q --force-reinstall --no-deps dist/hpc_batch-*.whl
+sudo systemctl reload hpc-batch
+```
+
+Use `reload`, not `restart`: reload makes the daemon persist its state and
+re-exec in place, so running jobs are re-adopted instead of killed. If the
+unit file itself changed, `sudo cp` it again and `systemctl daemon-reload`
+before reloading (re-applying the `--admin-group` edit from step 3).
 
 ## Admin configuration
 
@@ -54,6 +106,8 @@ systemd unit's `ExecStart=` line:
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--max-lifetime DURATION` | `1d` | Jobs running longer than this are killed. Also the upper bound and default for `--max-time`. |
+| `--keep-finished DURATION` | `7d` | How long a finished job stays listable and its state-dir output is kept. Does not affect the user's own copy. |
+| `--state-max-gb GB` | none | Size budget for the state directory; finished jobs are evicted oldest-first when exceeded. |
 | `--list-is-public` | off | Allow non-admins to use `dispatch list --all`. |
 | `--admin-group GROUP` | `wheel` | Members can list, attach to and kill any user's jobs. |
 | `--socket PATH` | `/run/hpc-batch/hpc-batch.sock` | Unix socket the daemon listens on. |
@@ -106,7 +160,13 @@ None of the policies starve the head: every job has a bounded lifetime
 
 ```sh
 # Submit: everything after "--" is the job's command line.
+# Output is saved to ./output.<id>.log when the job finishes.
 dispatch new --cpu 2 --gpu-cores 3 --max-mem 84 --max-time 2h -- ./run_benchmark.sh --iterations 10
+
+# Save the output somewhere else, or not at all:
+dispatch new --output ~/results -- ./run_benchmark.sh      # ~/results/output.<id>.log
+dispatch new --output ~/results/run1.log -- ./run_benchmark.sh
+dispatch new --no-output -- ./noisy_job.sh
 
 # Run alone on the machine (waits until idle, blocks others while running):
 dispatch new --cpu 8 --exclusive -- ./timing_sensitive_bench
@@ -114,6 +174,9 @@ dispatch new --cpu 8 --exclusive -- ./timing_sensitive_bench
 # List my jobs / all jobs (all = admins, or everyone with --list-is-public):
 dispatch list
 dispatch list --all
+
+# Include recently finished jobs, with their exit status:
+dispatch list --finished
 
 # Follow a job's output (admins can attach to any job):
 dispatch attach 7
@@ -123,7 +186,13 @@ dispatch kill 7
 ```
 
 `dispatch list` prints `<username> <id> <command> <uptime> <max-time>
-<exclusive>`; queued jobs show `queued` in the uptime column.
+<exclusive>`; queued jobs show `queued` in the uptime column. By default only
+queued and running jobs are listed. `--finished` also includes finished ones
+and appends `<state> <exit>`, where the exit column shows the exit code, or
+`killed`/`timeout`/`error` when the job did not exit on its own.
+
+`dispatch attach` follows a running job. Once a job has finished, read its
+`output.<id>.log` directly instead.
 
 The socket path for the client can be overridden with `$HPC_BATCH_SOCKET`
 (useful with a non-default `--socket`).

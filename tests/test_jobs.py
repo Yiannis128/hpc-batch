@@ -65,5 +65,31 @@ class TestJob:
         row = make_job().public_row(time.time())
         assert set(row) == {
             "user", "id", "command", "uptime_s", "max_time_s", "exclusive", "state",
+            "exit_code", "reason", "output_dest", "output_error",
         }
         assert row["state"] == QUEUED
+
+    def test_elapsed_survives_the_job_ending(self):
+        now = 1000.0
+        queued = make_job(state=QUEUED)
+        assert queued.elapsed(now) is None
+
+        running = make_job(state=RUNNING, start_time=990.0)
+        assert running.elapsed(now) == 10.0  # counts up against now
+
+        # uptime() goes None once the job is done, elapsed() stays final so
+        # `dispatch list --finished` can still show how long it ran.
+        done = make_job(state=DONE, start_time=900.0, end_time=925.0)
+        assert done.uptime(now) is None
+        assert done.elapsed(now) == 25.0
+
+    def test_public_row_reports_exit_status_of_finished_job(self):
+        row = make_job(state=DONE, start_time=900.0, end_time=925.0,
+                       exit_code=3).public_row(1000.0)
+        assert row["exit_code"] == 3
+        assert row["reason"] is None
+        assert row["uptime_s"] == 25.0
+
+        killed = make_job(state=DONE, start_time=900.0, end_time=925.0,
+                          exit_code=None, reason="timeout").public_row(1000.0)
+        assert killed["reason"] == "timeout"

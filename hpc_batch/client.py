@@ -12,7 +12,7 @@ import socket
 import sys
 
 from . import __version__
-from .protocol import MAX_LINE, QUEUED, encode, socket_path
+from .protocol import DONE, MAX_LINE, QUEUED, encode, socket_path
 from .util import duration_arg, format_duration, format_table
 
 
@@ -59,6 +59,9 @@ def _request(req: dict) -> dict:
 
 
 def cmd_new(args: argparse.Namespace, command: list[str]) -> int:
+    # Resolve --output here: the daemon's cwd is "/", so a relative path only
+    # means what the user intended if we make it absolute on their side.
+    output = None if args.no_output else os.path.abspath(args.output or os.getcwd())
     req = {
         "cmd": "new",
         "argv": command,
@@ -68,35 +71,62 @@ def cmd_new(args: argparse.Namespace, command: list[str]) -> int:
         "max_mem_gb": args.max_mem,
         "max_time_s": args.max_time,
         "exclusive": args.exclusive,
+        "output": output,
     }
     resp = _request(req)
     print(
         f"job {resp['id']} {resp['state']} "
         f"(max time {format_duration(resp.get('max_time_s'))})"
     )
+    if output:
+        print(f"output will be saved to {resp.get('output_dest', output)}")
     return 0
 
 
+def _exit_label(job: dict) -> str:
+    """The EXIT column: why the job stopped, or its exit code."""
+    if job["state"] != DONE:
+        return "-"
+    if job.get("reason"):
+        return job["reason"]
+    code = job.get("exit_code")
+    return "-" if code is None else str(code)
+
+
 def cmd_list(args: argparse.Namespace) -> int:
-    resp = _request({"cmd": "list", "all": args.all})
+    resp = _request({"cmd": "list", "all": args.all, "finished": args.finished})
     jobs = resp.get("jobs", [])
     if not jobs:
         print("no jobs")
         return 0
+    headers = ["USER", "ID", "COMMAND", "UPTIME", "MAX-TIME", "EXCLUSIVE"]
+    if args.finished:
+        headers += ["STATE", "EXIT"]
     rows = []
     for job in jobs:
         uptime = "queued" if job["state"] == QUEUED else format_duration(job["uptime_s"])
-        rows.append(
-            [
-                job["user"],
-                str(job["id"]),
-                job["command"],
-                uptime,
-                format_duration(job["max_time_s"]),
-                "yes" if job["exclusive"] else "no",
-            ]
-        )
-    print(format_table(["USER", "ID", "COMMAND", "UPTIME", "MAX-TIME", "EXCLUSIVE"], rows))
+        row = [
+            job["user"],
+            str(job["id"]),
+            job["command"],
+            uptime,
+            format_duration(job["max_time_s"]),
+            "yes" if job["exclusive"] else "no",
+        ]
+        if args.finished:
+            row += [job["state"], _exit_label(job)]
+        rows.append(row)
+    print(format_table(headers, rows))
+    # Saving the durable copy can fail long after submission (directory
+    # removed mid-run, quota hit), so surface it rather than leaving the user
+    # to wonder where their output went.
+    for job in jobs:
+        if job.get("output_error"):
+            print(
+                f"job {job['id']}: could not save output to "
+                f"{job.get('output_dest')}: {job['output_error']}",
+                file=sys.stderr,
+            )
     return 0
 
 
@@ -155,17 +185,31 @@ def build_parser() -> argparse.ArgumentParser:
                             "(default and upper bound: the admin's max lifetime)")
     p_new.add_argument("--exclusive", action="store_true",
                        help="run alone: wait for an idle machine and block others while running")
+    p_new.add_argument("--output", default=None, metavar="PATH",
+                       help="where to save the output when the job finishes: a "
+                            "directory, in which case it is written as "
+                            "output.<id>.log, or an exact file path "
+                            "(default: the current directory)")
+    p_new.add_argument("--no-output", action="store_true",
+                       help="do not save a copy; the output then only lives in "
+                            "the daemon's state directory until it is trimmed")
 
     p_list = sub.add_parser(
         "list",
         help="list current jobs",
         description="List queued and running jobs: "
-                    "<username> <id> <command> <uptime> <max-time> <exclusive>.",
+                    "<username> <id> <command> <uptime> <max-time> <exclusive>. "
+                    "With --finished, also lists recently finished jobs and adds "
+                    "<state> <exit> columns.",
     )
     p_list.add_argument(
         "--all", action="store_true",
         help="list every user's jobs (admins; everyone if the daemon "
              "was started with --list-is-public)",
+    )
+    p_list.add_argument(
+        "--finished", action="store_true",
+        help="also show recently finished jobs with their exit status",
     )
 
     p_attach = sub.add_parser(

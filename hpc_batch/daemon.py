@@ -48,7 +48,6 @@ log = logging.getLogger("hpc-batchd")
 
 TICK_S = 1.0
 KILL_GRACE_S = 10.0
-FINISHED_KEEP = 50
 ATTACH_POLL_S = 0.3
 
 
@@ -62,6 +61,51 @@ class Config:
     dev_dir: Path
     use_cgroups: bool
     schedule: str
+    keep_finished: int
+    state_max_gb: float | None
+
+
+def run_as_user(uid: int, gid: int, user: str, fn) -> str | None:
+    """Run ``fn`` in a forked child holding the given user's credentials.
+
+    Every filesystem operation on a path the *user* chose goes through here.
+    The daemon is root, so doing that work in-process would let a user borrow
+    root's privileges to reach a file they could not touch themselves (the
+    classic case being a symlink planted at the destination). Dropping to
+    their uid first means ordinary permission checks apply.
+
+    Returns None on success, or a message describing the failure.
+    """
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # child
+        os.close(read_fd)
+        msg = ""
+        try:
+            if os.getuid() == 0:
+                os.initgroups(user, gid)
+                os.setgid(gid)
+                os.setuid(uid)
+            fn()
+        except BaseException as exc:  # noqa: BLE001 - reported to the parent
+            msg = f"{type(exc).__name__}: {exc}"[:400] or "failed"
+        finally:
+            with contextlib.suppress(OSError):
+                os.write(write_fd, msg.encode())
+                os.close(write_fd)
+            os._exit(1 if msg else 0)
+
+    os.close(write_fd)
+    chunks = []
+    with contextlib.suppress(OSError):
+        while chunk := os.read(read_fd, 4096):
+            chunks.append(chunk)
+    os.close(read_fd)
+    # waitpid on our own pid only; it never reaps a job's Popen child.
+    _, status = os.waitpid(pid, 0)
+    if os.waitstatus_to_exitcode(status) == 0:
+        return None
+    return b"".join(chunks).decode(errors="replace") or "failed"
 
 
 def peer_creds(sock: socket.socket) -> tuple[int, int, int]:
@@ -362,6 +406,17 @@ class Daemon:
         max_time = min(requested, self.cfg.max_lifetime) if requested else self.cfg.max_lifetime
         cwd = req.get("cwd") if isinstance(req.get("cwd"), str) else pw.pw_dir
 
+        # Where the user's durable copy of the output goes. Absent or null
+        # means they opted out with --no-output.
+        output_dest = None
+        raw_output = req.get("output")
+        if isinstance(raw_output, str) and raw_output:
+            output_dest, problem = self._resolve_output_dest(
+                raw_output, self.next_id, uid, pw.pw_gid, pw.pw_name
+            )
+            if problem:
+                return err(f"cannot save output there: {problem}")
+
         job = Job(
             id=self.next_id,
             user=pw.pw_name,
@@ -375,6 +430,7 @@ class Daemon:
             max_time_s=max_time,
             exclusive=exclusive,
             submit_time=time.time(),
+            output_dest=output_dest,
         )
         self.next_id += 1
         self.jobs[job.id] = job
@@ -388,7 +444,13 @@ class Daemon:
         )
         self._schedule()
         self._persist()
-        return {"ok": True, "id": job.id, "state": job.state, "max_time_s": max_time}
+        return {
+            "ok": True,
+            "id": job.id,
+            "state": job.state,
+            "max_time_s": max_time,
+            "output_dest": job.output_dest,
+        }
 
     def _jobs_in_state(self, state: str) -> list[Job]:
         return [j for j in self.jobs.values() if j.state == state]
@@ -527,6 +589,68 @@ class Daemon:
         with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
             os.killpg(job.pid, signal.SIGKILL)
 
+    # -- durable output ---------------------------------------------------
+
+    def _resolve_output_dest(
+        self, raw: str, job_id: int, uid: int, gid: int, user: str
+    ) -> tuple[str | None, str | None]:
+        """Decide where this job's durable output copy goes and check now
+        that the user can write there. Returns (destination, error).
+
+        Validating at submit time is the point: a job that runs for 20 hours
+        and only then discovers its output directory is unwritable has lost
+        the user's work for no reason.
+        """
+        path = Path(raw)
+        if not path.is_absolute():
+            return None, "output path must be absolute"
+        # An existing directory means "write output.<id>.log in here";
+        # anything else is taken as the exact filename to write.
+        dest = path / f"output.{job_id}.log" if path.is_dir() else path
+        parent = dest.parent
+
+        def check() -> None:
+            if not parent.is_dir():
+                raise NotADirectoryError(f"{parent} is not a directory")
+            if not os.access(parent, os.W_OK | os.X_OK):
+                raise PermissionError(f"cannot write to {parent}")
+
+        error = run_as_user(uid, gid, user, check)
+        return (None, error) if error else (str(dest), None)
+
+    def _deliver_output(self, job: Job) -> None:
+        """Copy the job's captured output to the user's chosen destination.
+
+        The state-dir copy is what `dispatch attach` streams from while the
+        job runs; this is the copy the user keeps afterwards, on their own
+        storage. Failures here (directory deleted mid-run, quota exhausted)
+        are recorded on the job rather than raised, because the job itself
+        already succeeded or failed on its own terms.
+        """
+        if not job.output_dest:
+            return
+        src = self.output_path(job.id)
+        dest = Path(job.output_dest)
+
+        def copy() -> None:
+            # O_NOFOLLOW even though we have already dropped privileges: a
+            # symlink appearing at the destination between validation and
+            # now should fail loudly, not be followed.
+            fd = os.open(
+                dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o640
+            )
+            with open(fd, "wb") as out, open(src, "rb") as inp:
+                shutil.copyfileobj(inp, out)
+
+        job.output_error = run_as_user(job.uid, job.gid, job.user, copy)
+        if job.output_error:
+            log.warning(
+                "job %d: could not save output to %s: %s",
+                job.id, dest, job.output_error,
+            )
+        else:
+            log.info("job %d: output saved to %s", job.id, dest)
+
     def _finalize(self, job: Job, exit_code: int | None) -> None:
         job.state = DONE
         job.end_time = time.time()
@@ -543,6 +667,7 @@ class Daemon:
                 self._doomed_cgroups.append(cg)
             job.cgroup = None
         self._dev_remove(job.id)
+        self._deliver_output(job)
         self._job_changed(job)
         log.info(
             "job %d finished (exit=%s%s)",
@@ -550,13 +675,58 @@ class Daemon:
         )
         self._trim_finished()
 
-    def _trim_finished(self) -> None:
+    def _forget(self, job: Job) -> None:
+        self.jobs.pop(job.id, None)
+        shutil.rmtree(self.job_dir(job.id), ignore_errors=True)
+        self._dirty = True
+
+    @staticmethod
+    def _dir_size(path: Path) -> int:
+        total = 0
+        with contextlib.suppress(OSError):
+            for entry in path.rglob("*"):
+                with contextlib.suppress(OSError):
+                    if entry.is_file():
+                        total += entry.stat().st_size
+        return total
+
+    def _trim_finished(self, check_size: bool = True) -> None:
+        """Retention for finished jobs.
+
+        A job is dropped once it is older than --keep-finished, and if the
+        state directory is over --state-max-gb the oldest survivors are
+        evicted early to bring it back inside budget. This window is only a
+        convenience: the durable copy is the one delivered to the user's own
+        output path, so expiring an entry here never loses their work.
+
+        Age is the primary rule rather than a fixed job count, because a
+        count gives no guarantee anyone can plan around: on a busy day the
+        last 50 jobs might be half an hour.
+        """
+        now = time.time()
         done = sorted(
-            (j for j in self.jobs.values() if j.state == DONE), key=lambda j: j.id
+            (j for j in self.jobs.values() if j.state == DONE),
+            key=lambda j: j.end_time or 0.0,
         )
-        for job in done[:-FINISHED_KEEP]:
-            del self.jobs[job.id]
-            shutil.rmtree(self.job_dir(job.id), ignore_errors=True)
+        survivors = []
+        for job in done:
+            if now - (job.end_time or now) > self.cfg.keep_finished:
+                self._forget(job)
+            else:
+                survivors.append(job)
+
+        if not check_size or not self.cfg.state_max_gb:
+            return
+        budget = int(self.cfg.state_max_gb * (1 << 30))
+        size = self._dir_size(self.cfg.state_dir / "jobs")
+        while size > budget and survivors:
+            job = survivors.pop(0)  # oldest first
+            size -= self._dir_size(self.job_dir(job.id))
+            self._forget(job)
+            log.warning(
+                "state dir over its %.1f GiB budget: evicted finished job %d early",
+                self.cfg.state_max_gb, job.id,
+            )
 
     # -- periodic work ---------------------------------------------------
 
@@ -580,6 +750,10 @@ class Daemon:
         self._doomed_cgroups = [
             p for p in self._doomed_cgroups if not self.cgroups.try_remove(p)
         ]
+        # Age out finished jobs even on an idle daemon, where nothing new
+        # finishes to trigger it. Size is only checked on completion, which
+        # is the only time the state dir grows.
+        self._trim_finished(check_size=False)
         self._schedule()
         self._persist()
 
@@ -616,13 +790,14 @@ class Daemon:
 
     def _h_list(self, req: dict, uid: int) -> dict:
         show_all = bool(req.get("all"))
+        show_finished = bool(req.get("finished"))
         if show_all and not (self.cfg.list_is_public or self.is_admin(uid)):
             return err(f"'list --all' requires membership of group {self.cfg.admin_group!r}")
         now = time.time()
         rows = [
             job.public_row(now)
             for job in sorted(self.jobs.values(), key=lambda j: j.id)
-            if job.state != DONE and (show_all or job.uid == uid)
+            if (show_finished or job.state != DONE) and (show_all or job.uid == uid)
         ]
         return {"ok": True, "jobs": rows}
 
@@ -715,6 +890,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--dev-dir", type=Path, default=Path("/dev/hpc-batch"), metavar="DIR",
         help="where job inspection entries appear (default: /dev/hpc-batch)",
+    )
+    parser.add_argument(
+        "--keep-finished", type=duration_arg, default=604800, metavar="DURATION",
+        help="how long a finished job stays listable and its state-dir output "
+             "is kept (default: 7d). The user's own copy at their --output "
+             "path is unaffected by this.",
+    )
+    parser.add_argument(
+        "--state-max-gb", type=float, default=None, metavar="GB",
+        help="size budget for the state directory; finished jobs are evicted "
+             "oldest-first when it is exceeded (default: no budget)",
     )
     parser.add_argument(
         "--no-cgroups", dest="use_cgroups", action="store_false",

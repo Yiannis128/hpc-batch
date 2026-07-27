@@ -33,6 +33,8 @@ class Job:
     gpus: list[int] = field(default_factory=list)
     cgroup: str | None = None
     term_time: float | None = None  # when SIGTERM was sent, for escalation
+    output_dest: str | None = None  # user's durable copy; None = don't save one
+    output_error: str | None = None  # why delivering output_dest failed
 
     def command(self) -> str:
         return shlex.join(self.argv)
@@ -41,6 +43,15 @@ class Job:
         if self.state == RUNNING and self.start_time is not None:
             return now - self.start_time
         return None
+
+    def elapsed(self, now: float) -> float | None:
+        """Wall time spent running: counting up for a running job, final for a
+        finished one. Unlike `uptime` this survives the job ending, so
+        `dispatch list --finished` can show how long a job actually took."""
+        if self.start_time is None:
+            return None
+        end = self.end_time if self.end_time is not None else now
+        return end - self.start_time
 
     def deadline(self, now: float) -> float:
         """When this job's time limit expires. For a job that has not started
@@ -72,8 +83,12 @@ class Job:
             "user": self.user,
             "id": self.id,
             "command": self.command(),
-            "uptime_s": self.uptime(now),
+            "uptime_s": self.elapsed(now),
             "max_time_s": self.max_time_s,
             "exclusive": self.exclusive,
             "state": self.state,
+            "exit_code": self.exit_code,
+            "reason": self.reason,
+            "output_dest": self.output_dest,
+            "output_error": self.output_error,
         }
