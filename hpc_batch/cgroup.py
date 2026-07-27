@@ -16,6 +16,8 @@ import logging
 import os
 from pathlib import Path
 
+from .resources import format_id_list
+
 log = logging.getLogger(__name__)
 
 CGROUP_FS = Path("/sys/fs/cgroup")
@@ -82,18 +84,23 @@ class CgroupManager:
         self,
         job_id: int,
         cpus: list[int],
-        numa_node: int,
+        mems: list[int],
         mem_bytes: int | None,
     ) -> Path | None:
-        """Create the cgroup for a job; the spawned pid is added by the caller."""
+        """Create the cgroup for a job; the spawned pid is added by the caller.
+
+        ``mems`` is the set of NUMA nodes the scheduler charged this job's
+        memory to — usually just the node its cpus are on. Writing exactly
+        those nodes is what makes the accounting binding: the job cannot
+        allocate memory on a node nobody budgeted for it.
+        """
         if self.base is None:
             return None
         path = self.base / f"job-{job_id}"
         path.mkdir(exist_ok=True)
         if "cpuset" in self.controllers:
-            (path / "cpuset.cpus").write_text(",".join(str(c) for c in cpus))
-            # Confine memory allocation to the same NUMA node as the cpus.
-            (path / "cpuset.mems").write_text(str(numa_node))
+            (path / "cpuset.cpus").write_text(format_id_list(cpus))
+            (path / "cpuset.mems").write_text(format_id_list(mems))
         if "memory" in self.controllers:
             try:
                 # Never let a job swap: swapping would wreck benchmark
@@ -101,14 +108,29 @@ class CgroupManager:
                 (path / "memory.swap.max").write_text("0")
             except OSError:
                 pass  # kernel built without swap accounting
+            try:
+                # If one process OOMs, take the whole job down with it. Set
+                # unconditionally: a job left half-dead is a worse outcome
+                # than a clean kill whether or not it named a budget.
+                (path / "memory.oom.group").write_text("1")
+            except OSError:
+                pass
             if mem_bytes:
                 (path / "memory.max").write_text(str(mem_bytes))
-                try:
-                    # If one process OOMs, take the whole job down with it.
-                    (path / "memory.oom.group").write_text("1")
-                except OSError:
-                    pass
         return path
+
+    def oom_killed(self, path: Path) -> bool:
+        """Did the kernel OOM-kill anything in this cgroup? Read before the
+        cgroup is removed, so a job killed for exceeding its memory budget can
+        say so instead of just reporting SIGKILL."""
+        try:
+            for line in (path / "memory.events").read_text().splitlines():
+                key, _, value = line.partition(" ")
+                if key == "oom_kill":
+                    return int(value) > 0
+        except (OSError, ValueError):
+            pass
+        return False
 
     def confine_current(self, cgroup: Path | None, cpus: list[int]) -> None:
         """Confine the calling process to its job's resources. Runs in the

@@ -1,3 +1,4 @@
+import json
 import time
 
 from hpc_batch.jobs import DONE, QUEUED, RUNNING, Job
@@ -24,7 +25,8 @@ def make_job(**overrides) -> Job:
 
 class TestJob:
     def test_roundtrip(self):
-        job = make_job(state=RUNNING, pid=1234, cpus=[0, 1], gpus=[2], numa_node=0)
+        job = make_job(state=RUNNING, pid=1234, cpus=[0, 1], gpus=[2],
+                       numa_node=0, numa_nodes=[0], mem_by_node={0: 8.0})
         assert Job.from_dict(job.to_dict()) == job
 
     def test_from_dict_ignores_unknown_fields(self):
@@ -45,14 +47,56 @@ class TestJob:
         job.state = DONE
         assert job.uptime(now) is None
 
+    def test_state_file_roundtrip_keeps_memory_charge_per_node(self):
+        # JSON object keys are strings. If they came back as strings the pool
+        # would look for domain "0" instead of 0, find nothing, and quietly
+        # never give the memory back.
+        job = make_job(state=RUNNING, cpus=[0, 1], numa_node=0, numa_nodes=[0, 1],
+                       mem_by_node={0: 32.0, 1: 16.0})
+        revived = Job.from_dict(json.loads(json.dumps(job.to_dict())))
+        assert revived.mem_by_node == {0: 32.0, 1: 16.0}
+        assert revived == job
+
     def test_allocation_mirrors_held_resources(self):
-        job = make_job(state=RUNNING, cpus=[0, 1], gpus=[2], numa_node=1)
+        job = make_job(state=RUNNING, cpus=[0, 1], gpus=[2], numa_node=1,
+                       numa_nodes=[1], mem_by_node={1: 8.0})
         alloc = job.allocation()
         assert alloc.cpus == [0, 1]
         assert alloc.numa_node == 1
+        assert alloc.numa_nodes == [1]
         assert alloc.gpus == [2]
         assert alloc.mem_gb == job.max_mem_gb
+        assert alloc.mem_by_node == {1: 8.0}
         assert alloc.exclusive == job.exclusive
+
+    def test_older_state_is_normalised_on_load(self):
+        # A job persisted before per-node charges existed still has to give
+        # its memory back somewhere, or the node leaks capacity. Filling it in
+        # at load (not in allocation()) means it is written back on the next
+        # persist and every reader sees it, not just the scheduler.
+        legacy = make_job(state=RUNNING, cpus=[0], numa_node=1).to_dict()
+        del legacy["numa_nodes"], legacy["mem_by_node"]
+
+        job = Job.from_dict(legacy)
+
+        assert job.numa_nodes == [1]
+        assert job.mem_by_node == {1: 8.0}
+        assert job.allocation().mem_by_node == {1: 8.0}
+        assert job.public_row(1000.0)["mem_spans_nodes"] is False
+        # Normalised once: reloading the written-back form changes nothing.
+        assert Job.from_dict(job.to_dict()) == job
+
+    def test_queued_jobs_are_left_unplaced(self):
+        # Placement fields are meaningless before a job starts, and inventing
+        # them would charge the pool for a job that holds nothing.
+        job = Job.from_dict(make_job(state=QUEUED).to_dict())
+        assert job.numa_nodes == [] and job.mem_by_node == {}
+
+    def test_request_carries_the_placement_flags(self):
+        job = make_job(cpu=4, gpu_cores=2, numa_local=True, exclusive=True)
+        req = job.request()
+        assert (req.cpu, req.gpu_cores, req.mem_gb) == (4, 2, 8.0)
+        assert req.exclusive and req.numa_local
 
     def test_deadline_running_vs_queued(self):
         now = 1000.0
@@ -66,6 +110,7 @@ class TestJob:
         assert set(row) == {
             "user", "id", "command", "uptime_s", "max_time_s", "exclusive", "state",
             "exit_code", "reason", "output_dest", "output_error",
+            "max_mem_gb", "mem_defaulted", "mem_spans_nodes",
         }
         assert row["state"] == QUEUED
 

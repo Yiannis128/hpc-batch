@@ -17,6 +17,23 @@ and benchmark timings are stable.
   job (`memory.swap.max=0`, reinforced by `MemorySwapMax=0` in the unit):
   `--max-mem` is a hard RAM budget, and a job that exceeds it is
   OOM-killed as a whole group instead of thrashing in swap.
+- **Every job has a memory budget, whether or not it asks for one.** An
+  unbounded job would be invisible to the scheduler and could starve
+  everything sharing its node, so a job that omits `--max-mem` gets the
+  share of a NUMA node its cores represent — 4 of 32 cores on a 256 GiB
+  node is 32 GiB — floored at `--min-job-mem`. An `--exclusive` job gets the
+  whole machine. `dispatch new` prints the budget it was given.
+- **Memory is budgeted per NUMA node**, not machine-wide, because
+  `cpuset.mems` confines a job to the nodes it was charged for. Normally
+  that is one node and the job gets purely local memory. A budget that fits
+  no single node is spread across nodes instead of waiting; the extra nodes
+  go into `cpuset.mems`, so the job can never allocate where nobody
+  budgeted for it. Access to the remote part is slower, so `dispatch list`
+  marks those jobs with `+` and `--numa-local` refuses to spread at all,
+  waiting for a node that fits the whole budget. When the cpuset controller
+  is unavailable (undelegated, or `--no-cgroups`) a job really can allocate
+  anywhere, and the daemon tracks one machine-wide pool instead; the
+  startup log line says which mode is in force.
 - **GPUs**: `--gpu-cores N` allocates N of the GPUs enumerated by
   `nvidia-smi -L`; the job sees them via `CUDA_VISIBLE_DEVICES` (jobs that
   requested no GPUs get an empty `CUDA_VISIBLE_DEVICES`).
@@ -110,6 +127,9 @@ systemd unit's `ExecStart=` line:
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--max-lifetime DURATION` | `1d` | Jobs running longer than this are killed. Also the upper bound and default for `--max-time`. |
+| `--reserve-cpu N` | `2` | Cores held back for the OS and the daemon, never offered to jobs. Taken from the lowest-numbered NUMA node so the other nodes keep their full width. This is headroom, not a fence: nothing pins the OS to them. |
+| `--reserve-mem GB` | `2` | Memory held back for the OS and the daemon, off the same node as `--reserve-cpu`, and never more than half of any one node. |
+| `--min-job-mem GB` | `2` | Floor for an automatically assigned budget, so a single-core job on a core-dense machine is not left with a sliver. Ignored when the user passes `--max-mem`. |
 | `--keep-finished N` | `50` | Finished jobs remembered **per user** for `dispatch list --finished`. Metadata only; output is never kept here. |
 | `--list-is-public` | off | Allow non-admins to use `dispatch list --all`. |
 | `--admin-group GROUP` | `wheel` | Members can list, attach to and kill any user's jobs. |
@@ -171,8 +191,13 @@ dispatch new --output ~/results -- ./run_benchmark.sh      # ~/results/output.<i
 dispatch new --output ~/results/run1.log -- ./run_benchmark.sh
 dispatch new --no-output -- ./noisy_job.sh
 
-# Run alone on the machine (waits until idle, blocks others while running):
-dispatch new --cpu 8 --exclusive -- ./timing_sensitive_bench
+# Run alone on the machine (waits until idle, blocks others while running).
+# Without --cpu this takes every core and all the memory:
+dispatch new --exclusive -- ./timing_sensitive_bench
+
+# Insist on memory local to the job's own NUMA node, waiting for a node that
+# fits rather than spreading the budget across nodes:
+dispatch new --cpu 4 --max-mem 64 --numa-local -- ./latency_sensitive_bench
 
 # List my jobs / all jobs (all = admins, or everyone with --list-is-public):
 dispatch list
@@ -188,11 +213,15 @@ dispatch attach 7
 dispatch kill 7
 ```
 
-`dispatch list` prints `<username> <id> <command> <uptime> <max-time>
-<exclusive>`; queued jobs show `queued` in the uptime column. By default only
-queued and running jobs are listed. `--finished` also includes finished ones
-and appends `<state> <exit>`, where the exit column shows the exit code, or
-`killed`/`timeout`/`error` when the job did not exit on its own.
+`dispatch list` prints `<username> <id> <command> <uptime> <max-time> <mem>
+<exclusive>`; queued jobs show `queued` in the uptime column, and a `+` after
+the memory figure means that budget had to be spread over more than one NUMA
+node. By default only queued and running jobs are listed. `--finished` also
+includes finished ones and appends `<state> <exit>`, where the exit column
+shows the exit code, or `killed`/`timeout`/`error`/`oom` when the job did not
+exit on its own. `oom` means the job was killed for exceeding its memory
+budget, and the listing says whether that budget was one you asked for or one
+assigned by default.
 
 `dispatch attach` follows a running job. Once a job has finished its buffered
 output is gone, so read the `output.<id>.log` it left behind instead; attaching

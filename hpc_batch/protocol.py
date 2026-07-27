@@ -24,6 +24,7 @@ DONE = "done"
 KILLED = "killed"
 TIMEOUT = "timeout"
 ERROR = "error"
+OOM = "oom"
 
 
 def encode(obj: dict) -> bytes:

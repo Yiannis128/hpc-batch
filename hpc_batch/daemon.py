@@ -18,6 +18,7 @@ import contextlib
 import grp
 import json
 import logging
+import math
 import os
 import pwd
 import shutil
@@ -38,6 +39,7 @@ from .protocol import (
     ERROR,
     KILLED,
     MAX_LINE,
+    OOM,
     TIMEOUT,
     err,
     read_json,
@@ -45,13 +47,17 @@ from .protocol import (
 )
 from .resources import (
     Allocation,
+    Request,
     ResourcePool,
+    apply_reserve,
     discover_gpus,
+    discover_node_memory_gb,
     discover_numa_nodes,
+    format_id_list,
     total_memory_gb,
 )
 from .scheduling import FIFO_STRICT, MODES, Reservation, plan
-from .util import duration_arg, format_duration
+from .util import duration_arg, format_duration, format_gb
 
 log = logging.getLogger("hpc-batchd")
 
@@ -71,6 +77,9 @@ class Config:
     use_cgroups: bool
     schedule: str
     keep_finished: int
+    reserve_cpu: int
+    reserve_mem: float
+    min_job_mem: float
 
 
 def drop_privileges(uid: int, gid: int, user: str) -> None:
@@ -127,6 +136,16 @@ def run_as_user(uid: int, gid: int, user: str, fn) -> str | None:
     if os.waitstatus_to_exitcode(status) == 0:
         return None
     return b"".join(chunks).decode(errors="replace") or "failed"
+
+
+def _tidy_gb(gb: float) -> float:
+    """Round a derived budget to 2 decimals, always downwards.
+
+    Rounding to nearest would let a budget derived from the whole machine
+    land a hair above it, and the job would then be rejected by the very
+    limit it was computed from.
+    """
+    return math.floor(gb * 100) / 100
 
 
 def peer_creds(sock: socket.socket) -> tuple[int, int, int]:
@@ -279,14 +298,31 @@ class Daemon:
     def _setup_pool(self) -> None:
         nodes = discover_numa_nodes()
         gpus = discover_gpus()
-        mem = total_memory_gb()
-        self.pool = ResourcePool(node_cpus=nodes, gpu_ids=gpus, total_mem_gb=mem)
+        node_mem = discover_node_memory_gb(nodes)
+        # Memory is only confined to a node when we can actually write
+        # cpuset.mems. Without the cpuset controller (undelegated, or
+        # --no-cgroups) a job can allocate from any node, so track one
+        # machine-wide pool rather than enforcing a split that is not real.
+        # Runs after cgroups.setup(), so the controller set is known.
+        confined = bool(node_mem) and "cpuset" in self.cgroups.controllers
+        if not node_mem:
+            node_mem = {next(iter(nodes), 0): total_memory_gb()}
+        nodes, node_mem = apply_reserve(
+            nodes, node_mem, self.cfg.reserve_cpu, self.cfg.reserve_mem
+        )
+        self.pool = ResourcePool(
+            node_cpus=nodes, gpu_ids=gpus, node_mem_gb=node_mem, mem_confined=confined
+        )
         log.info(
-            "resources: %d cpus over %d NUMA node(s), %d gpu(s), %.0f GiB memory",
-            sum(len(c) for c in nodes.values()),
+            "resources available to jobs: %d cpus over %d NUMA node(s), %d gpu(s), "
+            "%.0f GiB memory (%s); reserved for the system: %d cpu, %g GiB",
+            self.pool.total_cpus(),
             len(nodes),
             len(gpus),
-            mem,
+            self.pool.usable_mem_gb(),
+            "per-node" if self.pool.mem_confined else "machine-wide",
+            self.cfg.reserve_cpu,
+            self.cfg.reserve_mem,
         )
 
     def _resolve_admin_gid(self) -> None:
@@ -411,20 +447,35 @@ class Daemon:
         if not self.is_root and uid != os.getuid():
             return err("daemon is not running as root; it can only run your own jobs")
         try:
-            cpu = int(req.get("cpu") or 1)
+            cpu_raw = req.get("cpu")
             gpu_cores = int(req.get("gpu_cores") or 0)
             mem_raw = req.get("max_mem_gb")
             mem_gb = float(mem_raw) if mem_raw is not None else None
             time_raw = req.get("max_time_s")
             requested = int(time_raw) if time_raw is not None else None
             exclusive = bool(req.get("exclusive"))
+            numa_local = bool(req.get("numa_local"))
+            # An exclusive job owns the machine, so "unspecified" means all
+            # of it rather than a single core.
+            default_cpu = self.pool.total_cpus() if exclusive else 1
+            cpu = int(cpu_raw) if cpu_raw is not None else default_cpu
         except (TypeError, ValueError):
             return err("malformed request")
         if cpu < 1 or gpu_cores < 0 or (mem_gb is not None and mem_gb <= 0) or (
             requested is not None and requested < 1
         ):
             return err("resource requests must be positive")
-        problem = self.pool.validate(cpu, gpu_cores, mem_gb)
+
+        # An unstated budget still has to be a number: an unbounded job would
+        # be invisible to the scheduler and could starve everything sharing
+        # its node. Derive one from the share of the machine being asked for.
+        mem_defaulted = mem_gb is None
+        if mem_defaulted:
+            mem_gb = self._default_mem_gb(cpu, exclusive)
+
+        problem = self.pool.validate(
+            Request(cpu, gpu_cores, mem_gb, exclusive, numa_local)
+        )
         if problem:
             return err(problem)
         # Users may claim less time than the admin ceiling, never more.
@@ -454,6 +505,8 @@ class Daemon:
             max_mem_gb=mem_gb,
             max_time_s=max_time,
             exclusive=exclusive,
+            numa_local=numa_local,
+            mem_defaulted=mem_defaulted,
             submit_time=time.time(),
             output_dest=output_dest,
         )
@@ -462,10 +515,13 @@ class Daemon:
         self._make_job_dir(job)
         self._job_changed(job)
         log.info(
-            "job %d submitted by %s: %s (cpu=%d gpu=%d mem=%s max-time=%s%s)",
+            "job %d submitted by %s: %s (cpu=%d gpu=%d mem=%s%s max-time=%s%s%s)",
             job.id, job.user, job.command(), cpu, gpu_cores,
-            f"{mem_gb:g}G" if mem_gb else "-", format_duration(max_time),
+            format_gb(mem_gb),
+            " default" if mem_defaulted else "",
+            format_duration(max_time),
             " exclusive" if exclusive else "",
+            " numa-local" if numa_local else "",
         )
         self._schedule()
         self._persist()
@@ -474,8 +530,27 @@ class Daemon:
             "id": job.id,
             "state": job.state,
             "max_time_s": max_time,
+            "cpu": cpu,
+            "max_mem_gb": mem_gb,
+            "mem_defaulted": mem_defaulted,
             "output_dest": job.output_dest,
         }
+
+    def _default_mem_gb(self, cpu: int, exclusive: bool) -> float | None:
+        """The memory budget for a job that did not name one.
+
+        An exclusive job has the machine, so it gets all of it. Everyone else
+        gets the share of a node their cores represent, floored so that a
+        small `--cpu` on a core-dense machine is not left with a couple of
+        gigabytes. Users who need a different number pass `--max-mem`.
+        """
+        if not self.pool.tracks_memory:
+            return None
+        if exclusive:
+            return _tidy_gb(self.pool.usable_mem_gb())
+        share = max(self.cfg.min_job_mem, self.pool.proportional_share(cpu))
+        # Never default above what a job could actually be given.
+        return _tidy_gb(min(share, self.pool.largest_node_mem_gb()))
 
     def _jobs_in_state(self, state: str) -> list[Job]:
         return [j for j in self.jobs.values() if j.state == state]
@@ -510,7 +585,7 @@ class Daemon:
         pw = pwd.getpwuid(job.uid)
         out_path = self.output_path(job.id)
         mem_bytes = int(alloc.mem_gb * (1 << 30)) if alloc.mem_gb else None
-        cg = self.cgroups.create(job.id, alloc.cpus, alloc.numa_node, mem_bytes)
+        cg = self.cgroups.create(job.id, alloc.cpus, alloc.mem_nodes(), mem_bytes)
 
         out_fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o640)
         devnull = os.open(os.devnull, os.O_RDONLY)
@@ -533,7 +608,7 @@ class Daemon:
         }
         if self.pool.gpu_ids:
             # Empty string for 0-gpu jobs: they must not see any gpu.
-            env["CUDA_VISIBLE_DEVICES"] = ",".join(str(g) for g in alloc.gpus)
+            env["CUDA_VISIBLE_DEVICES"] = format_id_list(alloc.gpus)
 
         try:
             proc = subprocess.Popen(
@@ -557,14 +632,19 @@ class Daemon:
         job.start_time = time.time()
         job.cpus = list(alloc.cpus)
         job.numa_node = alloc.numa_node
+        job.numa_nodes = list(alloc.numa_nodes)
+        job.mem_by_node = dict(alloc.mem_by_node)
         job.gpus = list(alloc.gpus)
         job.cgroup = str(cg) if cg is not None else None
         self._job_changed(job)
         log.info(
-            "job %d started (pid %d, node %d, cpus %s%s)",
-            job.id, job.pid, alloc.numa_node,
-            ",".join(str(c) for c in alloc.cpus),
-            f", gpus {','.join(str(g) for g in alloc.gpus)}" if alloc.gpus else "",
+            "job %d started (pid %d, node %s, cpus %s%s, mem nodes %s%s)",
+            job.id, job.pid,
+            format_id_list(alloc.numa_nodes),
+            format_id_list(alloc.cpus),
+            f", gpus {format_id_list(alloc.gpus)}" if alloc.gpus else "",
+            format_id_list(alloc.mem_nodes()),
+            " (spans nodes: remote memory is slower)" if alloc.spans_nodes else "",
         )
 
     def _write_output_line(self, job: Job, text: str) -> None:
@@ -692,6 +772,11 @@ class Daemon:
             self.pool.release(job.allocation())
         if job.cgroup:
             cg = Path(job.cgroup)
+            # Read the OOM counter before the cgroup goes away: without it a
+            # job killed for exceeding its budget just looks like SIGKILL, and
+            # the user has no way to tell that memory was the problem.
+            if job.reason is None and self.cgroups.oom_killed(cg):
+                job.reason = OOM
             if not self.cgroups.try_remove(cg):
                 self._doomed_cgroups.append(cg)
             job.cgroup = None
@@ -907,6 +992,24 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="how many finished jobs to remember per user, for 'dispatch list "
              "--finished' (default: 50). Metadata only; job output is "
              "delivered to the user's own directory and never kept here.",
+    )
+    parser.add_argument(
+        "--reserve-cpu", type=int, default=2, metavar="N",
+        help="cpu cores held back for the OS and this daemon, never offered "
+             "to jobs (default: 2). Taken from the lowest-numbered NUMA node "
+             "so the other nodes keep their full width.",
+    )
+    parser.add_argument(
+        "--reserve-mem", type=float, default=2.0, metavar="GB",
+        help="memory in GiB held back for the OS and this daemon (default: 2). "
+             "Taken from the same node as --reserve-cpu, and never more than "
+             "half of any one node.",
+    )
+    parser.add_argument(
+        "--min-job-mem", type=float, default=2.0, metavar="GB",
+        help="floor for an automatically assigned memory budget (default: 2). "
+             "Jobs that did not pass --max-mem get the share of a node their "
+             "cores represent, but never less than this.",
     )
     parser.add_argument(
         "--no-cgroups", dest="use_cgroups", action="store_false",

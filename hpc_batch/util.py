@@ -54,6 +54,15 @@ def format_duration(seconds: float | None) -> str:
     return "".join(parts)
 
 
+def format_gb(gb: float | None) -> str:
+    """Format a memory figure compactly, e.g. 16.5 -> "16.5G". None -> "-".
+
+    Note the `is None` test: a budget of 0 is not the same as no budget, and
+    a falsy check would render it as if the job had none.
+    """
+    return "-" if gb is None else f"{gb:g}G"
+
+
 def format_table(headers: list[str], rows: list[list[str]]) -> str:
     """Render rows as a left-aligned, space-padded table."""
     widths = [len(h) for h in headers]

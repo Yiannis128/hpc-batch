@@ -22,8 +22,8 @@ Three policies:
   finishing jobs are NOT added to the budget -- they are held for the head,
   so no job started once the machine is full jumps ahead of it. This
   prevents a stream of small jobs from starving a big one, with no runtime
-  estimates. (The budget is a total across NUMA nodes; the real allocator
-  still confines each job's CPUs to one node.)
+  estimates. (The budget is kept per NUMA node, matching the allocator,
+  which confines each job's CPUs and memory to a single node.)
 
 - ``strict-backfill`` -- reserve using the jobs' ``max_time``. The head job
   gets a reservation: the earliest time it is guaranteed to be able to run,
@@ -38,6 +38,8 @@ Three policies:
 import math
 from dataclasses import dataclass
 
+from .resources import ResourcePool
+
 FIFO_STRICT = "fifo-strict"
 EASY_BACKFILL = "easy-backfill"
 STRICT_BACKFILL = "strict-backfill"
@@ -48,20 +50,27 @@ MODES = (FIFO_STRICT, EASY_BACKFILL, STRICT_BACKFILL)
 class Reservation:
     """easy-backfill's frozen budget for a blocked head job, carried across
     ticks. Backfill jobs draw the budget down; it is never replenished, so
-    freed resources accrue to the head instead."""
+    freed resources accrue to the head instead.
+
+    The budget is a snapshot of the pool itself, taken when the head first
+    blocked, rather than a set of counters beside it. That matters because
+    "does this job fit?" is not a simple comparison: it involves NUMA
+    placement, memory domains, spanning budgets, exclusivity. A second,
+    weaker implementation of that question would disagree with the allocator
+    sooner or later, and could not even express parts of a request. Asking
+    the snapshot means there is only one implementation.
+    """
 
     head_id: int
-    cpu: int
-    gpu: int
-    mem: float | None
+    budget: ResourcePool
 
 
-def _alloc(pool, job):
-    return pool.allocate(job.cpu, job.gpu_cores, job.max_mem_gb, job.exclusive)
+def _alloc(pool, job, node=None):
+    return pool.allocate(job.request(), node=node)
 
 
 def _fits(pool, job) -> bool:
-    return pool.would_fit(job.cpu, job.gpu_cores, job.max_mem_gb, job.exclusive)
+    return pool.would_fit(job.request())
 
 
 def _fill_fifo(queued, pool):
@@ -116,33 +125,28 @@ def _plan_easy(queued, pool, reservation):
     to_start, blocked_at = _fill_fifo(queued, pool)
     if blocked_at is None:
         return to_start, None
-    cpu, gpu, mem = pool.free_totals()
-    reservation = Reservation(head_id=queued[blocked_at].id, cpu=cpu, gpu=gpu, mem=mem)
+    reservation = Reservation(head_id=queued[blocked_at].id, budget=pool.clone())
     to_start += _backfill(queued[blocked_at + 1:], pool, reservation)
     return to_start, reservation
 
 
 def _backfill(candidates, pool, reservation):
-    """Start each job that still fits within the reservation's frozen budget,
-    drawing the budget down as we go."""
+    """Start each job the frozen budget can still place, drawing it down.
+
+    The job is allocated out of the budget and the *same* allocation is then
+    reserved in the live pool. The budget is a frozen subset of the pool —
+    the pool only gains capacity afterwards, and loses exactly what backfill
+    takes — so whatever the budget could place is placeable in the pool on
+    precisely the same cpus, gpus and nodes. Hence no second opinion to
+    reconcile, and a job can never take capacity that was freed after the
+    freeze and is being held for the head.
+    """
     to_start = []
     for job in candidates:
-        if job.cpu > reservation.cpu or job.gpu_cores > reservation.gpu:
-            continue
-        if (
-            reservation.mem is not None
-            and job.max_mem_gb is not None
-            and job.max_mem_gb > reservation.mem
-        ):
-            continue
-        alloc = _alloc(pool, job)
-        if alloc is None:
-            continue  # budget said yes but the pool disagreed; leave it queued
-        reservation.cpu -= job.cpu
-        reservation.gpu -= job.gpu_cores
-        if reservation.mem is not None and job.max_mem_gb is not None:
-            reservation.mem -= job.max_mem_gb
-        to_start.append((job, alloc))
+        alloc = reservation.budget.allocate(job.request())
+        if alloc is not None:
+            pool.reserve(alloc)
+            to_start.append((job, alloc))
     return to_start
 
 

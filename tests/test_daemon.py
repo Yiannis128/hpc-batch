@@ -3,6 +3,7 @@ from pathlib import Path
 
 from hpc_batch.daemon import Config, Daemon, run_as_user
 from hpc_batch.jobs import DONE, RUNNING, Job
+from hpc_batch.resources import ResourcePool
 
 
 def make_config(tmp_path: Path, **kw) -> Config:
@@ -16,6 +17,9 @@ def make_config(tmp_path: Path, **kw) -> Config:
         use_cgroups=False,
         schedule="fifo-strict",
         keep_finished=50,
+        reserve_cpu=2,
+        reserve_mem=2.0,
+        min_job_mem=2.0,
     )
     defaults.update(kw)
     return Config(**defaults)
@@ -195,3 +199,94 @@ class TestRetireOutput:
 
         assert job.output_error is not None
         assert daemon.output_path(1).read_bytes() == b"captured output\n"
+
+
+def pooled_daemon(tmp_path, **kw) -> Daemon:
+    """A daemon with a known two-node machine instead of the real one."""
+    daemon = make_daemon(tmp_path, **kw)
+    daemon.pool = ResourcePool(
+        node_cpus={0: [0, 1, 2, 3], 1: [4, 5, 6, 7]},
+        gpu_ids=[],
+        node_mem_gb={0: 32.0, 1: 32.0},
+    )
+    return daemon
+
+
+class TestDefaultMemoryBudget:
+    def test_scales_with_the_cores_asked_for(self, tmp_path):
+        daemon = pooled_daemon(tmp_path)
+        # 4 cpus / 32 GiB a node, so a core is worth 8 GiB.
+        assert daemon._default_mem_gb(1, exclusive=False) == 8.0
+        assert daemon._default_mem_gb(2, exclusive=False) == 16.0
+        assert daemon._default_mem_gb(4, exclusive=False) == 32.0
+
+    def test_floor_protects_small_requests(self, tmp_path):
+        # A core-dense node: one core's share is 0.5 GiB, which nothing real
+        # runs in. The admin floor is what keeps casual jobs working.
+        daemon = make_daemon(tmp_path, min_job_mem=2.0)
+        daemon.pool = ResourcePool(
+            node_cpus={0: list(range(64))}, gpu_ids=[], node_mem_gb={0: 32.0}
+        )
+        assert daemon._default_mem_gb(1, exclusive=False) == 2.0
+
+    def test_never_defaults_above_what_a_node_can_give(self, tmp_path):
+        daemon = make_daemon(tmp_path, min_job_mem=999.0)
+        daemon.pool = ResourcePool(
+            node_cpus={0: [0, 1]}, gpu_ids=[], node_mem_gb={0: 8.0}
+        )
+        # An absurd floor must not produce a budget that can never be placed.
+        assert daemon._default_mem_gb(1, exclusive=False) == 8.0
+
+    def test_exclusive_gets_the_whole_machine(self, tmp_path):
+        daemon = pooled_daemon(tmp_path)
+        assert daemon._default_mem_gb(8, exclusive=True) == 64.0
+
+    def test_none_when_memory_is_untracked(self, tmp_path):
+        daemon = make_daemon(tmp_path)
+        daemon.pool = ResourcePool(
+            node_cpus={0: [0, 1]}, gpu_ids=[], node_mem_gb={0: 0.0}
+        )
+        assert daemon._default_mem_gb(1, exclusive=False) is None
+
+
+class TestSubmit:
+    def submit(self, daemon, **kw) -> dict:
+        req = {"cmd": "new", "argv": ["true"], "cwd": "/"}
+        req.update(kw)
+        return daemon._submit(req, os.getuid())
+
+    def test_unstated_budget_is_filled_in_and_reported(self, tmp_path):
+        daemon = pooled_daemon(tmp_path)
+        resp = self.submit(daemon, cpu=2)
+        assert resp["ok"] and resp["mem_defaulted"] is True
+        assert resp["max_mem_gb"] == 16.0
+        # The job carries the number, so the scheduler can account for it.
+        assert daemon.jobs[resp["id"]].max_mem_gb == 16.0
+
+    def test_explicit_budget_is_kept_and_marked_as_such(self, tmp_path):
+        daemon = pooled_daemon(tmp_path)
+        resp = self.submit(daemon, cpu=2, max_mem_gb=4.0)
+        assert resp["max_mem_gb"] == 4.0 and resp["mem_defaulted"] is False
+
+    def test_exclusive_defaults_to_every_core(self, tmp_path):
+        daemon = pooled_daemon(tmp_path)
+        resp = self.submit(daemon, exclusive=True)
+        assert resp["cpu"] == 8
+        assert resp["max_mem_gb"] == 64.0
+
+    def test_budget_may_span_nodes_by_default(self, tmp_path):
+        daemon = pooled_daemon(tmp_path)
+        assert self.submit(daemon, cpu=1, max_mem_gb=48.0)["ok"]
+
+    def test_numa_local_rejects_a_budget_no_node_can_hold(self, tmp_path):
+        daemon = pooled_daemon(tmp_path)
+        resp = self.submit(daemon, cpu=1, max_mem_gb=48.0, numa_local=True)
+        assert not resp["ok"]
+        assert "--numa-local" in resp["error"] and "--exclusive" in resp["error"]
+
+    def test_numa_local_queues_when_merely_unavailable(self, tmp_path):
+        daemon = pooled_daemon(tmp_path)
+        # Fits a node in principle, so it must queue rather than be refused.
+        resp = self.submit(daemon, cpu=1, max_mem_gb=32.0, numa_local=True)
+        assert resp["ok"]
+        assert daemon.jobs[resp["id"]].numa_local is True

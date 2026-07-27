@@ -1,6 +1,6 @@
 import pytest
 
-from hpc_batch.util import format_duration, format_table, parse_duration
+from hpc_batch.util import format_duration, format_gb, format_table, parse_duration
 
 
 class TestParseDuration:
@@ -51,3 +51,17 @@ class TestFormatTable:
         assert lines[0] == "A    LONG"
         assert lines[1] == "xxx  y"
         assert lines[2] == "z    wwwww"
+
+
+class TestFormatGb:
+    def test_compact(self):
+        assert format_gb(16.0) == "16G"
+        assert format_gb(4.18) == "4.18G"
+
+    def test_absent_is_a_dash(self):
+        assert format_gb(None) == "-"
+
+    def test_zero_is_not_absent(self):
+        # A budget of 0 is a real (if useless) limit; rendering it as "-"
+        # would claim the job has no limit at all.
+        assert format_gb(0.0) == "0G"
