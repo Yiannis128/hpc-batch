@@ -126,6 +126,7 @@ class Job:
             "user": self.user,
             "id": self.id,
             "command": self.command(),
+            "start_time": self.start_time,
             "uptime_s": self.elapsed(now),
             "max_time_s": self.max_time_s,
             "exclusive": self.exclusive,

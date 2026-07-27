@@ -892,7 +892,10 @@ class Daemon:
             for job in sorted(self.jobs.values(), key=lambda j: j.id)
             if (show_finished or job.state != DONE) and (show_all or job.uid == uid)
         ]
-        return {"ok": True, "jobs": rows}
+        # Send the clock the rows were built against: uptime_s is already
+        # relative to it, and the client needs it to place a job's absolute
+        # start_time against "today" without consulting a second clock.
+        return {"ok": True, "jobs": rows, "now": now}
 
     def _find_job(self, req: dict, uid: int) -> tuple[Job | None, dict | None]:
         try:

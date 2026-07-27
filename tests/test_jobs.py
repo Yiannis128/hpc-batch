@@ -108,11 +108,16 @@ class TestJob:
     def test_public_row_fields(self):
         row = make_job().public_row(time.time())
         assert set(row) == {
-            "user", "id", "command", "uptime_s", "max_time_s", "exclusive", "state",
-            "exit_code", "reason", "output_dest", "output_error",
-            "max_mem_gb", "mem_defaulted", "mem_spans_nodes",
+            "user", "id", "command", "start_time", "uptime_s", "max_time_s",
+            "exclusive", "state", "exit_code", "reason", "output_dest",
+            "output_error", "max_mem_gb", "mem_defaulted", "mem_spans_nodes",
         }
         assert row["state"] == QUEUED
+        assert row["start_time"] is None  # queued: it has not started yet
+
+    def test_public_row_reports_the_start_time(self):
+        row = make_job(state=RUNNING, start_time=900.0).public_row(1000.0)
+        assert row["start_time"] == 900.0
 
     def test_elapsed_survives_the_job_ending(self):
         now = 1000.0

@@ -10,10 +10,11 @@ import json
 import os
 import socket
 import sys
+import time
 
 from . import __version__
 from .protocol import DONE, MAX_LINE, OOM, QUEUED, encode, socket_path
-from .util import duration_arg, format_duration, format_gb, format_table
+from .util import duration_arg, format_duration, format_gb, format_table, format_time
 
 
 class DispatchError(Exception):
@@ -108,9 +109,13 @@ def cmd_list(args: argparse.Namespace) -> int:
     if not jobs:
         print("no jobs")
         return 0
-    headers = ["USER", "ID", "COMMAND", "UPTIME", "MAX-TIME", "MEM", "EXCLUSIVE"]
+    headers = ["USER", "ID", "COMMAND", "START", "UPTIME", "MAX-TIME", "MEM", "EXCLUSIVE"]
     if args.finished:
         headers += ["STATE", "EXIT"]
+    # The daemon stamps the response with the clock it built the rows against.
+    # Falling back to ours only matters against a daemon too old to send it,
+    # which is also too old to send start_time, so START is "-" either way.
+    now = resp.get("now", time.time())
     rows = []
     for job in jobs:
         uptime = "queued" if job["state"] == QUEUED else format_duration(job["uptime_s"])
@@ -123,6 +128,7 @@ def cmd_list(args: argparse.Namespace) -> int:
             job["user"],
             str(job["id"]),
             job["command"],
+            format_time(job.get("start_time"), now),
             uptime,
             format_duration(job["max_time_s"]),
             label,
@@ -241,9 +247,9 @@ def build_parser() -> argparse.ArgumentParser:
         "list",
         help="list current jobs",
         description="List queued and running jobs: "
-                    "<username> <id> <command> <uptime> <max-time> <mem> "
-                    "<exclusive>. With --finished, also lists recently finished "
-                    "jobs and adds <state> <exit> columns.",
+                    "<username> <id> <command> <start> <uptime> <max-time> "
+                    "<mem> <exclusive>. With --finished, also lists recently "
+                    "finished jobs and adds <state> <exit> columns.",
     )
     p_list.add_argument(
         "--all", action="store_true",

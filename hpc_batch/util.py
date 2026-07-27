@@ -2,6 +2,7 @@
 
 import argparse
 import re
+import time
 
 _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 _DURATION_RE = re.compile(r"(\d+)([smhd])")
@@ -52,6 +53,24 @@ def format_duration(seconds: float | None) -> str:
     if secs or not parts:
         parts.append(f"{secs}s")
     return "".join(parts)
+
+
+def format_time(ts: float | None, now: float) -> str:
+    """Format a wall-clock timestamp for the listing: "14:03:12" for something
+    that happened today, "07-26 14:03" for an older one. None -> "-".
+
+    Both are local time, matching the clock the user reads elsewhere. `now`
+    fixes what "today" means, and is passed in rather than read here for the
+    same reason `Job.elapsed` takes it: the caller decides which clock the
+    whole listing is judged against.
+    """
+    if ts is None:
+        return "-"
+    when = time.localtime(ts)
+    today = time.localtime(now)
+    if (when.tm_year, when.tm_yday) == (today.tm_year, today.tm_yday):
+        return time.strftime("%H:%M:%S", when)
+    return time.strftime("%m-%d %H:%M", when)
 
 
 def format_gb(gb: float | None) -> str:

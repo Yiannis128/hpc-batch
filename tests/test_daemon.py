@@ -290,3 +290,16 @@ class TestSubmit:
         resp = self.submit(daemon, cpu=1, max_mem_gb=32.0, numa_local=True)
         assert resp["ok"]
         assert daemon.jobs[resp["id"]].numa_local is True
+
+
+class TestList:
+    def test_response_carries_the_clock_the_rows_were_built_against(self, tmp_path):
+        daemon = make_daemon(tmp_path)
+        add_job(daemon, 1, state=RUNNING)  # start_time=0.0, no end_time yet
+        resp = daemon._h_list({}, os.getuid())
+        row = resp["jobs"][0]
+        # The client renders the START column from start_time against this
+        # "now". Sending it means both come from the daemon's clock, so the
+        # start time and the uptime beside it can never disagree.
+        assert row["start_time"] == 0.0
+        assert resp["now"] == row["start_time"] + row["uptime_s"]

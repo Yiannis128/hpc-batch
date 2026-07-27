@@ -1,6 +1,14 @@
+import time
+
 import pytest
 
-from hpc_batch.util import format_duration, format_gb, format_table, parse_duration
+from hpc_batch.util import (
+    format_duration,
+    format_gb,
+    format_table,
+    format_time,
+    parse_duration,
+)
 
 
 class TestParseDuration:
@@ -51,6 +59,29 @@ class TestFormatTable:
         assert lines[0] == "A    LONG"
         assert lines[1] == "xxx  y"
         assert lines[2] == "z    wwwww"
+
+
+def _local(year, month, day, hour, minute, second=0):
+    """Epoch seconds for a local wall-clock time, so the expected rendering is
+    the same whatever timezone the tests run in."""
+    return time.mktime((year, month, day, hour, minute, second, 0, 0, -1))
+
+
+class TestFormatTime:
+    def test_not_started_is_a_dash(self):
+        assert format_time(None, _local(2026, 7, 27, 9, 0)) == "-"
+
+    def test_today_shows_the_clock_time(self):
+        now = _local(2026, 7, 27, 18, 30)
+        assert format_time(_local(2026, 7, 27, 14, 3, 12), now) == "14:03:12"
+
+    def test_earlier_day_shows_the_date(self):
+        now = _local(2026, 7, 27, 18, 30)
+        assert format_time(_local(2026, 7, 26, 14, 3, 12), now) == "07-26 14:03"
+
+    def test_same_day_of_year_in_another_year_is_not_today(self):
+        now = _local(2026, 7, 27, 18, 30)
+        assert format_time(_local(2025, 7, 27, 14, 3), now) == "07-27 14:03"
 
 
 class TestFormatGb:
