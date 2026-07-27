@@ -77,11 +77,19 @@ class TestFormatTime:
 
     def test_earlier_day_shows_the_date(self):
         now = _local(2026, 7, 27, 18, 30)
-        assert format_time(_local(2026, 7, 26, 14, 3, 12), now) == "07-26 14:03"
+        assert format_time(_local(2026, 7, 26, 14, 3, 12), now) == "2026-07-26 14:03"
 
     def test_same_day_of_year_in_another_year_is_not_today(self):
         now = _local(2026, 7, 27, 18, 30)
-        assert format_time(_local(2025, 7, 27, 14, 3), now) == "07-27 14:03"
+        assert format_time(_local(2025, 7, 27, 14, 3), now) == "2025-07-27 14:03"
+
+    def test_the_year_tells_old_jobs_apart(self):
+        # Finished jobs are kept by count, not by age, so a listing can hold
+        # two jobs a year apart. Without the year they would read the same.
+        now = _local(2026, 7, 27, 18, 30)
+        last_year = format_time(_local(2025, 6, 22, 17, 54), now)
+        this_year = format_time(_local(2026, 6, 22, 17, 54), now)
+        assert last_year != this_year
 
 
 class TestFormatGb:

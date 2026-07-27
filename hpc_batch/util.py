@@ -57,7 +57,12 @@ def format_duration(seconds: float | None) -> str:
 
 def format_time(ts: float | None, now: float) -> str:
     """Format a wall-clock timestamp for the listing: "14:03:12" for something
-    that happened today, "07-26 14:03" for an older one. None -> "-".
+    that happened today, "2026-07-26 14:03" for an older one. None -> "-".
+
+    The older form carries the year because finished jobs are retained by
+    count, not by age: a user who runs few jobs keeps entries well over a
+    year old, and a bare "07-26" would render those identically to this
+    year's.
 
     Both are local time, matching the clock the user reads elsewhere. `now`
     fixes what "today" means, and is passed in rather than read here for the
@@ -70,7 +75,7 @@ def format_time(ts: float | None, now: float) -> str:
     today = time.localtime(now)
     if (when.tm_year, when.tm_yday) == (today.tm_year, today.tm_yday):
         return time.strftime("%H:%M:%S", when)
-    return time.strftime("%m-%d %H:%M", when)
+    return time.strftime("%Y-%m-%d %H:%M", when)
 
 
 def format_gb(gb: float | None) -> str:

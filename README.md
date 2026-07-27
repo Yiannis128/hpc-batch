@@ -215,15 +215,15 @@ dispatch kill 7
 
 `dispatch list` prints `<username> <id> <command> <start> <uptime> <max-time>
 <mem> <exclusive>`; the start column is the local clock time the job began,
-shown as `HH:MM:SS` for a job that started today and `MM-DD HH:MM` for an older
-one. Queued jobs have not started, so they show `-` there and `queued` in the
-uptime column. A `+` after the memory figure means that budget had to be spread
-over more than one NUMA node. By default only queued and running jobs are
-listed. `--finished` also includes finished ones and appends `<state> <exit>`,
-where the exit column shows the exit code, or `killed`/`timeout`/`error`/`oom`
-when the job did not exit on its own. `oom` means the job was killed for
-exceeding its memory budget, and the listing says whether that budget was one
-you asked for or one assigned by default.
+shown as `HH:MM:SS` for a job that started today and `YYYY-MM-DD HH:MM` for an
+older one. Queued jobs have not started, so they show `-` there and `queued` in
+the uptime column. A `+` after the memory figure means that budget had to be
+spread over more than one NUMA node. By default only queued and running jobs
+are listed. `--finished` also includes finished ones and appends `<state>
+<exit>`, where the exit column shows the exit code, or
+`killed`/`timeout`/`error`/`oom` when the job did not exit on its own. `oom`
+means the job was killed for exceeding its memory budget, and the listing says
+whether that budget was one you asked for or one assigned by default.
 
 `dispatch attach` follows a running job. Once a job has finished its buffered
 output is gone, so read the `output.<id>.log` it left behind instead; attaching
