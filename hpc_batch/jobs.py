@@ -27,7 +27,7 @@ class Job:
     pid: int | None = None
     proc_start: int | None = None  # /proc/<pid>/stat starttime, guards pid reuse
     exit_code: int | None = None
-    reason: str | None = None  # None | "killed" | "timeout" | "error"
+    reason: str | None = None  # None, or one of protocol's KILLED/TIMEOUT/ERROR
     cpus: list[int] = field(default_factory=list)
     numa_node: int | None = None
     gpus: list[int] = field(default_factory=list)
@@ -39,19 +39,20 @@ class Job:
     def command(self) -> str:
         return shlex.join(self.argv)
 
-    def uptime(self, now: float) -> float | None:
-        if self.state == RUNNING and self.start_time is not None:
-            return now - self.start_time
-        return None
-
     def elapsed(self, now: float) -> float | None:
         """Wall time spent running: counting up for a running job, final for a
-        finished one. Unlike `uptime` this survives the job ending, so
-        `dispatch list --finished` can show how long a job actually took."""
+        finished one. Survives the job ending, so `dispatch list --finished`
+        can show how long a job actually took."""
         if self.start_time is None:
             return None
         end = self.end_time if self.end_time is not None else now
         return end - self.start_time
+
+    def uptime(self, now: float) -> float | None:
+        """`elapsed` restricted to a running job. The time-limit check works
+        off this, so that a job which is over but not yet reaped can never
+        look like it is still accruing runtime."""
+        return self.elapsed(now) if self.state == RUNNING else None
 
     def deadline(self, now: float) -> float:
         """When this job's time limit expires. For a job that has not started

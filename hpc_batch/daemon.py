@@ -33,7 +33,16 @@ from pathlib import Path
 from . import __version__
 from .cgroup import CgroupManager
 from .jobs import DONE, QUEUED, RUNNING, Job
-from .protocol import DEFAULT_SOCKET, MAX_LINE, err, read_json, send_json
+from .protocol import (
+    DEFAULT_SOCKET,
+    ERROR,
+    KILLED,
+    MAX_LINE,
+    TIMEOUT,
+    err,
+    read_json,
+    send_json,
+)
 from .resources import (
     Allocation,
     ResourcePool,
@@ -64,6 +73,22 @@ class Config:
     keep_finished: int
 
 
+def drop_privileges(uid: int, gid: int, user: str) -> None:
+    """Become `user`, irreversibly. Call only between fork and exec/work.
+
+    The order is the whole point: supplementary groups have to be set while
+    we still have the privilege to set them, and setgid has to precede
+    setuid for the same reason. Getting it wrong leaves the process holding
+    credentials it should have shed, so both the job-spawn path and the
+    output-delivery path share this one definition.
+    """
+    if os.getuid() != 0:
+        return  # development mode: nothing to drop
+    os.initgroups(user, gid)
+    os.setgid(gid)
+    os.setuid(uid)
+
+
 def run_as_user(uid: int, gid: int, user: str, fn) -> str | None:
     """Run ``fn`` in a forked child holding the given user's credentials.
 
@@ -81,13 +106,10 @@ def run_as_user(uid: int, gid: int, user: str, fn) -> str | None:
         os.close(read_fd)
         msg = ""
         try:
-            if os.getuid() == 0:
-                os.initgroups(user, gid)
-                os.setgid(gid)
-                os.setuid(uid)
+            drop_privileges(uid, gid, user)
             fn()
         except BaseException as exc:  # noqa: BLE001 - reported to the parent
-            msg = f"{type(exc).__name__}: {exc}"[:400] or "failed"
+            msg = f"{type(exc).__name__}: {exc}"[:400]
         finally:
             with contextlib.suppress(OSError):
                 os.write(write_fd, msg.encode())
@@ -481,7 +503,7 @@ class Daemon:
             log.exception("failed to start job %d", job.id)
             self.pool.release(alloc)
             self._write_output_line(job, f"hpc-batch: failed to start job: {exc}")
-            job.reason = "error"
+            job.reason = ERROR
             self._finalize(job, None)
 
     def _start_job(self, job: Job, alloc: Allocation) -> None:
@@ -497,10 +519,7 @@ class Daemon:
         def preexec() -> None:
             # Runs in the child, still as root, just before exec.
             self.cgroups.confine_current(cg, alloc.cpus)
-            if self.is_root:
-                os.initgroups(pw.pw_name, pw.pw_gid)
-                os.setgid(pw.pw_gid)
-                os.setuid(job.uid)
+            drop_privileges(job.uid, pw.pw_gid, pw.pw_name)
             os.chdir(job.cwd)  # as the target user, so permissions apply
 
         env = {
@@ -621,56 +640,45 @@ class Daemon:
         error = run_as_user(uid, gid, user, check)
         return (None, error) if error else (str(dest), None)
 
-    def _deliver_output(self, job: Job) -> None:
-        """Copy the job's captured output to the user's chosen destination.
+    def _retire_output(self, job: Job) -> None:
+        """Hand the job's output to the user, then drop our copy.
 
-        The state-dir copy is what `dispatch attach` streams from while the
-        job runs; this is the copy the user keeps afterwards, on their own
-        storage. Failures here (directory deleted mid-run, quota exhausted)
-        are recorded on the job rather than raised, because the job itself
-        already succeeded or failed on its own terms.
-        """
-        if not job.output_dest:
-            return
-        src = self.output_path(job.id)
-        dest = Path(job.output_dest)
-
-        def copy() -> None:
-            # O_NOFOLLOW even though we have already dropped privileges: a
-            # symlink appearing at the destination between validation and
-            # now should fail loudly, not be followed.
-            fd = os.open(
-                dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o640
-            )
-            with open(fd, "wb") as out, open(src, "rb") as inp:
-                shutil.copyfileobj(inp, out)
-
-        job.output_error = run_as_user(job.uid, job.gid, job.user, copy)
-        if job.output_error:
-            log.warning(
-                "job %d: could not save output to %s: %s",
-                job.id, dest, job.output_error,
-            )
-        else:
-            log.info("job %d: output saved to %s", job.id, dest)
-
-    def _discard_output(self, job: Job) -> None:
-        """Drop the state-dir copy of the output now the job is over.
-
-        That file exists so `dispatch attach` has something to stream while
-        the job runs. Once it ends the copy that matters is the user's, at
-        output_dest, so keeping a second one would grow the state directory
-        for no benefit. Clients already attached hold an open fd and finish
+        The state-dir file is a buffer so `dispatch attach` has something to
+        stream while the job runs, not storage. Once the job ends we copy it
+        to the user's chosen destination and unlink ours, so the only lasting
+        copy is theirs. Clients still attached hold an open fd and finish
         their stream normally, by ordinary unlink semantics.
 
-        The one exception is a delivery that failed: then this is the only
-        copy left, so it survives until --keep-finished expires it, and the
-        error recorded on the job says so.
+        A failed copy (directory deleted mid-run, quota exhausted) is
+        recorded on the job rather than raised, since the job itself already
+        succeeded or failed on its own terms, and the buffer stays put
+        because it is then the only copy left.
         """
-        if job.output_dest and job.output_error:
-            return
+        src = self.output_path(job.id)
+        if job.output_dest:
+            dest = Path(job.output_dest)
+
+            def copy() -> None:
+                # O_NOFOLLOW even though we have already dropped privileges:
+                # a symlink appearing at the destination between validation
+                # and now should fail loudly, not be followed.
+                fd = os.open(
+                    dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o640
+                )
+                with open(fd, "wb") as out, open(src, "rb") as inp:
+                    shutil.copyfileobj(inp, out)
+
+            job.output_error = run_as_user(job.uid, job.gid, job.user, copy)
+            if job.output_error:
+                log.warning(
+                    "job %d: could not save output to %s: %s; keeping %s",
+                    job.id, dest, job.output_error, src,
+                )
+                return
+            log.info("job %d: output saved to %s", job.id, dest)
+
         with contextlib.suppress(OSError):
-            self.output_path(job.id).unlink(missing_ok=True)
+            src.unlink(missing_ok=True)
 
     def _finalize(self, job: Job, exit_code: int | None) -> None:
         job.state = DONE
@@ -688,8 +696,7 @@ class Daemon:
                 self._doomed_cgroups.append(cg)
             job.cgroup = None
         self._dev_remove(job.id)
-        self._deliver_output(job)
-        self._discard_output(job)
+        self._retire_output(job)
         self._job_changed(job)
         log.info(
             "job %d finished (exit=%s%s)",
@@ -748,7 +755,7 @@ class Daemon:
                     job,
                     f"hpc-batch: job exceeded its time limit ({format_duration(job.max_time_s)}); killing",
                 )
-                self._request_kill(job, "timeout")
+                self._request_kill(job, TIMEOUT)
             elif job.term_time is not None and now - job.term_time > KILL_GRACE_S:
                 self._hard_kill(job)
                 job.term_time = now  # re-arm so we retry rather than busy-kill
@@ -821,11 +828,11 @@ class Daemon:
         if job.state == DONE:
             return err(f"job {job.id} already finished")
         if job.state == QUEUED:
-            job.reason = "killed"
+            job.reason = KILLED
             self._finalize(job, None)
             self._persist()
             return {"ok": True, "state": "removed"}
-        self._request_kill(job, "killed")
+        self._request_kill(job, KILLED)
         self._persist()
         return {"ok": True, "state": "killing"}
 

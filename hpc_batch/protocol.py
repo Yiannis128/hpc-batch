@@ -19,6 +19,12 @@ QUEUED = "queued"
 RUNNING = "running"
 DONE = "done"
 
+# Why a job stopped, when it did not exit on its own. Also wire contract:
+# `dispatch list --finished` prints these verbatim in its EXIT column.
+KILLED = "killed"
+TIMEOUT = "timeout"
+ERROR = "error"
+
 
 def encode(obj: dict) -> bytes:
     """One protocol frame: a JSON object on a single line."""
