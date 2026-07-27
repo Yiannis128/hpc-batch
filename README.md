@@ -110,7 +110,7 @@ systemd unit's `ExecStart=` line:
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--max-lifetime DURATION` | `1d` | Jobs running longer than this are killed. Also the upper bound and default for `--max-time`. |
-| `--keep-finished DURATION` | `7d` | How long a finished job stays visible to `dispatch list --finished`. Metadata only; output is never kept here. |
+| `--keep-finished N` | `50` | Finished jobs remembered **per user** for `dispatch list --finished`. Metadata only; output is never kept here. |
 | `--list-is-public` | off | Allow non-admins to use `dispatch list --all`. |
 | `--admin-group GROUP` | `wheel` | Members can list, attach to and kill any user's jobs. |
 | `--socket PATH` | `/run/hpc-batch/hpc-batch.sock` | Unix socket the daemon listens on. |

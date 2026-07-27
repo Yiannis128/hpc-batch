@@ -16,7 +16,7 @@ def make_config(tmp_path: Path, **kw) -> Config:
         dev_dir=tmp_path / "dev",
         use_cgroups=False,
         schedule="fifo-strict",
-        keep_finished=604800,
+        keep_finished=50,
     )
     defaults.update(kw)
     return Config(**defaults)
@@ -28,9 +28,12 @@ def make_daemon(tmp_path: Path, **kw) -> Daemon:
     return daemon
 
 
-def add_job(daemon: Daemon, job_id: int, *, state=DONE, end_time=None, size=0) -> Job:
+def add_job(
+    daemon: Daemon, job_id: int, *, state=DONE, end_time=None, size=0, uid=None
+) -> Job:
+    uid = os.getuid() if uid is None else uid
     job = Job(
-        id=job_id, user="u", uid=os.getuid(), gid=os.getgid(),
+        id=job_id, user=f"u{uid}", uid=uid, gid=os.getgid(),
         argv=["true"], cwd="/", cpu=1, gpu_cores=0, max_mem_gb=None,
         max_time_s=60, exclusive=False, state=state,
         start_time=0.0, end_time=end_time,
@@ -105,35 +108,52 @@ class TestOutputDestination:
 
 
 class TestRetention:
-    def test_finished_jobs_expire_by_age(self, tmp_path):
-        daemon = make_daemon(tmp_path, keep_finished=100)
-        now = time.time()
-        fresh = add_job(daemon, 1, end_time=now - 10)
-        stale = add_job(daemon, 2, end_time=now - 1000)
+    def test_keeps_the_most_recent_n_per_user(self, tmp_path):
+        daemon = make_daemon(tmp_path, keep_finished=2)
+        for job_id in (1, 2, 3, 4):
+            add_job(daemon, job_id, end_time=time.time())
 
         daemon._trim_finished()
 
-        assert 1 in daemon.jobs
-        assert 2 not in daemon.jobs
-        assert daemon.job_dir(1).exists()
-        assert not daemon.job_dir(2).exists()
+        assert sorted(daemon.jobs) == [3, 4]
+        assert not daemon.job_dir(1).exists()
+        assert daemon.job_dir(4).exists()
+
+    def test_one_busy_user_does_not_evict_another(self, tmp_path):
+        # The whole point of counting per user: alice submitting all evening
+        # must not empty bob's list.
+        daemon = make_daemon(tmp_path, keep_finished=2)
+        for job_id in (1, 2, 3, 4, 5):
+            add_job(daemon, job_id, uid=1001, end_time=time.time())
+        add_job(daemon, 6, uid=1002, end_time=time.time())
+
+        daemon._trim_finished()
+
+        assert sorted(daemon.jobs) == [4, 5, 6]  # alice's last 2, bob's 1
 
     def test_running_jobs_are_never_trimmed(self, tmp_path):
         daemon = make_daemon(tmp_path, keep_finished=1)
         add_job(daemon, 1, state=RUNNING, end_time=None)
+        add_job(daemon, 2, state=RUNNING, end_time=None)
         daemon._trim_finished()
-        assert 1 in daemon.jobs
+        assert sorted(daemon.jobs) == [1, 2]
 
-    def test_expiry_is_independent_of_whether_output_exists(self, tmp_path):
+    def test_zero_keeps_nothing(self, tmp_path):
+        # jobs[:-0] would be the whole list, so this guards the slice.
+        daemon = make_daemon(tmp_path, keep_finished=0)
+        add_job(daemon, 1, end_time=time.time())
+        daemon._trim_finished()
+        assert daemon.jobs == {}
+
+    def test_retention_is_independent_of_whether_output_exists(self, tmp_path):
         # --finished is driven by tracked job metadata, not by leftover files,
         # so a job whose output was discarded is still listable.
-        daemon = make_daemon(tmp_path, keep_finished=100)
+        daemon = make_daemon(tmp_path, keep_finished=50)
         job = add_job(daemon, 1, end_time=time.time(), size=64)
         daemon.output_path(1).unlink()
 
         daemon._trim_finished()
 
-        assert 1 in daemon.jobs
         assert daemon.jobs[1] is job
 
 

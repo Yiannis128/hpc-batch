@@ -180,6 +180,10 @@ class Daemon:
         self._setup_pool()
         self._resolve_admin_gid()
         self._load_state()
+        # Apply the retention limit to what we just loaded, so lowering
+        # --keep-finished takes effect on the next start rather than only
+        # once another job happens to finish.
+        self._trim_finished()
         self._rebuild_dev_links()
 
         loop = asyncio.get_running_loop()
@@ -699,22 +703,34 @@ class Daemon:
         self._dirty = True
 
     def _trim_finished(self) -> None:
-        """Drop finished jobs once they are older than --keep-finished.
+        """Keep each user's most recent --keep-finished finished jobs.
 
-        Only metadata accumulates here. A job's output goes to the user's own
-        directory and the state-dir copy is discarded the moment the job
-        ends, so this window costs one small info.json per job and exists
-        purely so `dispatch list --finished` has something to report.
+        Per user, not globally: a global count lets one busy account evict
+        everyone else's history, so your job list would empty out because
+        somebody else was busy.
 
-        Age rather than a job count, because a count gives no guarantee
-        anyone can plan around: on a busy day the last 50 jobs might be half
-        an hour.
+        Only metadata is normally at stake. A job's output goes to the user's
+        own directory and the state-dir buffer is dropped when the job ends,
+        so trimming costs one small info.json. The exception is a job whose
+        delivery failed, where the buffer is the only copy left; those are
+        trimmed like any other once they fall out of the window, so the
+        eviction is logged with the path being lost.
         """
-        now = time.time()
-        for job in list(self.jobs.values()):
-            if job.state != DONE:
-                continue
-            if now - (job.end_time or now) > self.cfg.keep_finished:
+        keep = max(0, self.cfg.keep_finished)
+        per_user: dict[int, list[Job]] = {}
+        for job in self.jobs.values():
+            if job.state == DONE:
+                per_user.setdefault(job.uid, []).append(job)
+
+        for jobs in per_user.values():
+            jobs.sort(key=lambda j: j.id)  # id is submission order
+            for job in (jobs[:-keep] if keep else jobs):
+                if job.output_dest and job.output_error:
+                    log.warning(
+                        "job %d (%s): discarding undelivered output at %s; "
+                        "past the %d finished-job limit",
+                        job.id, job.user, self.output_path(job.id), keep,
+                    )
                 self._forget(job)
 
     # -- periodic work ---------------------------------------------------
@@ -739,9 +755,6 @@ class Daemon:
         self._doomed_cgroups = [
             p for p in self._doomed_cgroups if not self.cgroups.try_remove(p)
         ]
-        # Age out finished jobs even on an idle daemon, where nothing new
-        # finishes to trigger it.
-        self._trim_finished()
         self._schedule()
         self._persist()
 
@@ -883,9 +896,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="where job inspection entries appear (default: /dev/hpc-batch)",
     )
     parser.add_argument(
-        "--keep-finished", type=duration_arg, default=604800, metavar="DURATION",
-        help="how long a finished job stays visible to 'dispatch list "
-             "--finished' (default: 7d). Metadata only; job output is "
+        "--keep-finished", type=int, default=50, metavar="N",
+        help="how many finished jobs to remember per user, for 'dispatch list "
+             "--finished' (default: 50). Metadata only; job output is "
              "delivered to the user's own directory and never kept here.",
     )
     parser.add_argument(
