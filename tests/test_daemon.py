@@ -17,7 +17,6 @@ def make_config(tmp_path: Path, **kw) -> Config:
         use_cgroups=False,
         schedule="fifo-strict",
         keep_finished=604800,
-        state_max_gb=None,
     )
     defaults.update(kw)
     return Config(**defaults)
@@ -125,31 +124,49 @@ class TestRetention:
         daemon._trim_finished()
         assert 1 in daemon.jobs
 
-    def test_size_budget_evicts_oldest_first(self, tmp_path):
-        # 3 MiB of output against a 2 MiB budget: the oldest goes.
-        one_mib = 1 << 20
-        daemon = make_daemon(tmp_path, state_max_gb=2 / 1024)
-        now = time.time()
-        add_job(daemon, 1, end_time=now - 300, size=one_mib)
-        add_job(daemon, 2, end_time=now - 200, size=one_mib)
-        add_job(daemon, 3, end_time=now - 100, size=one_mib)
+    def test_expiry_is_independent_of_whether_output_exists(self, tmp_path):
+        # --finished is driven by tracked job metadata, not by leftover files,
+        # so a job whose output was discarded is still listable.
+        daemon = make_daemon(tmp_path, keep_finished=100)
+        job = add_job(daemon, 1, end_time=time.time(), size=64)
+        daemon.output_path(1).unlink()
 
         daemon._trim_finished()
 
-        assert 1 not in daemon.jobs
-        assert 2 in daemon.jobs and 3 in daemon.jobs
-
-    def test_size_budget_is_skipped_when_not_checking(self, tmp_path):
-        one_mib = 1 << 20
-        daemon = make_daemon(tmp_path, state_max_gb=1 / 2048)  # 0.5 MiB
-        add_job(daemon, 1, end_time=time.time(), size=one_mib)
-
-        daemon._trim_finished(check_size=False)
-
-        assert 1 in daemon.jobs  # age is fine, and size was not consulted
-
-    def test_no_budget_means_no_size_eviction(self, tmp_path):
-        daemon = make_daemon(tmp_path, state_max_gb=None)
-        add_job(daemon, 1, end_time=time.time(), size=1 << 20)
-        daemon._trim_finished()
         assert 1 in daemon.jobs
+        assert daemon.jobs[1] is job
+
+
+class TestDiscardOutput:
+    """The state-dir copy is a streaming buffer for `attach`, not storage."""
+
+    def test_discarded_after_successful_delivery(self, tmp_path):
+        daemon = make_daemon(tmp_path)
+        job = add_job(daemon, 1, end_time=time.time(), size=64)
+        job.output_dest = str(tmp_path / "kept.log")
+        job.output_error = None
+
+        daemon._discard_output(job)
+
+        assert not daemon.output_path(1).exists()
+
+    def test_discarded_when_the_user_opted_out(self, tmp_path):
+        daemon = make_daemon(tmp_path)
+        job = add_job(daemon, 1, end_time=time.time(), size=64)
+        job.output_dest = None  # --no-output
+
+        daemon._discard_output(job)
+
+        assert not daemon.output_path(1).exists()
+
+    def test_kept_when_delivery_failed(self, tmp_path):
+        # Otherwise this would be the only copy and we would be deleting the
+        # user's results because we could not hand them over.
+        daemon = make_daemon(tmp_path)
+        job = add_job(daemon, 1, end_time=time.time(), size=64)
+        job.output_dest = str(tmp_path / "gone" / "out.log")
+        job.output_error = "FileNotFoundError: ..."
+
+        daemon._discard_output(job)
+
+        assert daemon.output_path(1).exists()

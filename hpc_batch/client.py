@@ -137,6 +137,15 @@ def cmd_attach(args: argparse.Namespace) -> int:
         resp = _read_response(f)
         if resp.get("state") == QUEUED:
             print(f"job {args.id} is queued; waiting for it to start...", file=sys.stderr)
+        elif resp.get("state") == DONE:
+            # The streamed copy is dropped when a job ends, so point at the
+            # file the user actually kept rather than printing nothing.
+            dest = resp.get("output_dest")
+            note = (
+                f"its output is at {dest}" if dest
+                else "it ran with --no-output, so nothing was kept"
+            )
+            print(f"job {args.id} has finished; {note}", file=sys.stderr)
         out = sys.stdout.buffer
         # read1: forward each chunk as it arrives rather than blocking to
         # fill a full buffer.
@@ -191,8 +200,8 @@ def build_parser() -> argparse.ArgumentParser:
                             "output.<id>.log, or an exact file path "
                             "(default: the current directory)")
     p_new.add_argument("--no-output", action="store_true",
-                       help="do not save a copy; the output then only lives in "
-                            "the daemon's state directory until it is trimmed")
+                       help="discard the output when the job ends; 'dispatch "
+                            "attach' still works while it runs")
 
     p_list = sub.add_parser(
         "list",

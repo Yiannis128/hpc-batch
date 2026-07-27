@@ -24,13 +24,17 @@ and benchmark timings are stable.
   `/dev/hpc-batch/jobs/<id>` (a symlink to its state directory) containing
   `info.json` (metadata) and `output` (combined stdout/stderr). Entries are
   owned by the submitting user with the admin group as group owner.
-- **Output you keep**: when a job finishes, its combined stdout/stderr is
-  copied to `output.<id>.log` in the directory you submitted from, so your
-  results live on your own storage and outlive anything the daemon prunes.
-  `--output` picks a different directory or filename, `--no-output` opts
-  out. The destination is checked for writability at submit time, so a bad
-  path is rejected immediately rather than after the job has run, and the
-  copy is written as *you*, never as root.
+- **Output you keep**: while a job runs its combined stdout/stderr is
+  buffered in the state directory so `dispatch attach` has something to
+  stream. When it finishes that buffer is copied to `output.<id>.log` in the
+  directory you submitted from and then dropped, so the daemon never stores
+  your results: the only lasting copy is yours, on your own storage.
+  `--output` picks a different directory or filename, `--no-output` discards
+  the buffer instead of copying it (attach still works while the job runs).
+  The destination is checked for writability at submit time, so a bad path
+  is rejected immediately rather than after the job has run, and the copy is
+  written as *you*, never as root. If the copy fails the buffer is kept so
+  nothing is lost, and the error is reported by `dispatch list --finished`.
 - **Authentication**: the daemon identifies clients by `SO_PEERCRED` on the
   unix socket, so users cannot impersonate each other. Jobs are executed
   under the submitting user's uid/gid with a clean environment.
@@ -106,8 +110,7 @@ systemd unit's `ExecStart=` line:
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--max-lifetime DURATION` | `1d` | Jobs running longer than this are killed. Also the upper bound and default for `--max-time`. |
-| `--keep-finished DURATION` | `7d` | How long a finished job stays listable and its state-dir output is kept. Does not affect the user's own copy. |
-| `--state-max-gb GB` | none | Size budget for the state directory; finished jobs are evicted oldest-first when exceeded. |
+| `--keep-finished DURATION` | `7d` | How long a finished job stays visible to `dispatch list --finished`. Metadata only; output is never kept here. |
 | `--list-is-public` | off | Allow non-admins to use `dispatch list --all`. |
 | `--admin-group GROUP` | `wheel` | Members can list, attach to and kill any user's jobs. |
 | `--socket PATH` | `/run/hpc-batch/hpc-batch.sock` | Unix socket the daemon listens on. |
@@ -191,8 +194,9 @@ queued and running jobs are listed. `--finished` also includes finished ones
 and appends `<state> <exit>`, where the exit column shows the exit code, or
 `killed`/`timeout`/`error` when the job did not exit on its own.
 
-`dispatch attach` follows a running job. Once a job has finished, read its
-`output.<id>.log` directly instead.
+`dispatch attach` follows a running job. Once a job has finished its buffered
+output is gone, so read the `output.<id>.log` it left behind instead; attaching
+to a finished job just tells you where that file is.
 
 The socket path for the client can be overridden with `$HPC_BATCH_SOCKET`
 (useful with a non-default `--socket`).

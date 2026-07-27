@@ -62,7 +62,6 @@ class Config:
     use_cgroups: bool
     schedule: str
     keep_finished: int
-    state_max_gb: float | None
 
 
 def run_as_user(uid: int, gid: int, user: str, fn) -> str | None:
@@ -651,6 +650,24 @@ class Daemon:
         else:
             log.info("job %d: output saved to %s", job.id, dest)
 
+    def _discard_output(self, job: Job) -> None:
+        """Drop the state-dir copy of the output now the job is over.
+
+        That file exists so `dispatch attach` has something to stream while
+        the job runs. Once it ends the copy that matters is the user's, at
+        output_dest, so keeping a second one would grow the state directory
+        for no benefit. Clients already attached hold an open fd and finish
+        their stream normally, by ordinary unlink semantics.
+
+        The one exception is a delivery that failed: then this is the only
+        copy left, so it survives until --keep-finished expires it, and the
+        error recorded on the job says so.
+        """
+        if job.output_dest and job.output_error:
+            return
+        with contextlib.suppress(OSError):
+            self.output_path(job.id).unlink(missing_ok=True)
+
     def _finalize(self, job: Job, exit_code: int | None) -> None:
         job.state = DONE
         job.end_time = time.time()
@@ -668,6 +685,7 @@ class Daemon:
             job.cgroup = None
         self._dev_remove(job.id)
         self._deliver_output(job)
+        self._discard_output(job)
         self._job_changed(job)
         log.info(
             "job %d finished (exit=%s%s)",
@@ -680,53 +698,24 @@ class Daemon:
         shutil.rmtree(self.job_dir(job.id), ignore_errors=True)
         self._dirty = True
 
-    @staticmethod
-    def _dir_size(path: Path) -> int:
-        total = 0
-        with contextlib.suppress(OSError):
-            for entry in path.rglob("*"):
-                with contextlib.suppress(OSError):
-                    if entry.is_file():
-                        total += entry.stat().st_size
-        return total
+    def _trim_finished(self) -> None:
+        """Drop finished jobs once they are older than --keep-finished.
 
-    def _trim_finished(self, check_size: bool = True) -> None:
-        """Retention for finished jobs.
+        Only metadata accumulates here. A job's output goes to the user's own
+        directory and the state-dir copy is discarded the moment the job
+        ends, so this window costs one small info.json per job and exists
+        purely so `dispatch list --finished` has something to report.
 
-        A job is dropped once it is older than --keep-finished, and if the
-        state directory is over --state-max-gb the oldest survivors are
-        evicted early to bring it back inside budget. This window is only a
-        convenience: the durable copy is the one delivered to the user's own
-        output path, so expiring an entry here never loses their work.
-
-        Age is the primary rule rather than a fixed job count, because a
-        count gives no guarantee anyone can plan around: on a busy day the
-        last 50 jobs might be half an hour.
+        Age rather than a job count, because a count gives no guarantee
+        anyone can plan around: on a busy day the last 50 jobs might be half
+        an hour.
         """
         now = time.time()
-        done = sorted(
-            (j for j in self.jobs.values() if j.state == DONE),
-            key=lambda j: j.end_time or 0.0,
-        )
-        survivors = []
-        for job in done:
+        for job in list(self.jobs.values()):
+            if job.state != DONE:
+                continue
             if now - (job.end_time or now) > self.cfg.keep_finished:
                 self._forget(job)
-            else:
-                survivors.append(job)
-
-        if not check_size or not self.cfg.state_max_gb:
-            return
-        budget = int(self.cfg.state_max_gb * (1 << 30))
-        size = self._dir_size(self.cfg.state_dir / "jobs")
-        while size > budget and survivors:
-            job = survivors.pop(0)  # oldest first
-            size -= self._dir_size(self.job_dir(job.id))
-            self._forget(job)
-            log.warning(
-                "state dir over its %.1f GiB budget: evicted finished job %d early",
-                self.cfg.state_max_gb, job.id,
-            )
 
     # -- periodic work ---------------------------------------------------
 
@@ -751,9 +740,8 @@ class Daemon:
             p for p in self._doomed_cgroups if not self.cgroups.try_remove(p)
         ]
         # Age out finished jobs even on an idle daemon, where nothing new
-        # finishes to trigger it. Size is only checked on completion, which
-        # is the only time the state dir grows.
-        self._trim_finished(check_size=False)
+        # finishes to trigger it.
+        self._trim_finished()
         self._schedule()
         self._persist()
 
@@ -833,7 +821,10 @@ class Daemon:
         if problem:
             await send_json(writer, problem)
             return
-        await send_json(writer, {"ok": True, "state": job.state})
+        await send_json(
+            writer,
+            {"ok": True, "state": job.state, "output_dest": job.output_dest},
+        )
         path = self.output_path(job.id)
         f = None
         try:
@@ -893,14 +884,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--keep-finished", type=duration_arg, default=604800, metavar="DURATION",
-        help="how long a finished job stays listable and its state-dir output "
-             "is kept (default: 7d). The user's own copy at their --output "
-             "path is unaffected by this.",
-    )
-    parser.add_argument(
-        "--state-max-gb", type=float, default=None, metavar="GB",
-        help="size budget for the state directory; finished jobs are evicted "
-             "oldest-first when it is exceeded (default: no budget)",
+        help="how long a finished job stays visible to 'dispatch list "
+             "--finished' (default: 7d). Metadata only; job output is "
+             "delivered to the user's own directory and never kept here.",
     )
     parser.add_argument(
         "--no-cgroups", dest="use_cgroups", action="store_false",
