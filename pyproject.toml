@@ -4,24 +4,48 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hpc-batch"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Single-node FIFO batch job dispatcher with cgroup + NUMA isolation"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Yiannis Charalambous" }]
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+keywords = ["hpc", "batch", "scheduler", "cgroups", "numa", "systemd", "benchmark"]
 classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: No Input/Output (Daemon)",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Science/Research",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: System :: Distributed Computing",
+    "Topic :: System :: Systems Administration",
 ]
 dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Yiannis128/hpc-batch"
+Repository = "https://github.com/Yiannis128/hpc-batch"
+Issues = "https://github.com/Yiannis128/hpc-batch/issues"
 
 [project.scripts]
 dispatch = "hpc_batch.client:main"
 hpc-batchd = "hpc_batch.daemon:main"
+hpc-batch-install = "hpc_batch.install:main"
+
+# Single source of truth: the daemon logs __version__, and a release that
+# disagreed with the metadata would be untraceable.
+[tool.hatch.version]
+path = "hpc_batch/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["hpc_batch"]
+artifacts = ["hpc_batch/data/*.service"]
 
 [tool.hatch.envs.default]
 dependencies = ["pytest"]

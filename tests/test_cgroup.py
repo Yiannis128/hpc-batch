@@ -8,8 +8,10 @@ mistake in it silently turns a hard guarantee into a hope.
 
 from pathlib import Path
 
+import pytest
+
 from hpc_batch import cgroup as cgroup_mod
-from hpc_batch.cgroup import CgroupManager
+from hpc_batch.cgroup import CgroupError, CgroupManager
 
 
 def manager(tmp_path: Path, controllers=("cpuset", "memory")) -> CgroupManager:
@@ -32,8 +34,9 @@ def read(path: Path, name: str) -> str:
 
 class TestSetup:
     """The job subtree lives outside the daemon's service cgroup, and has to
-    survive the daemon being restarted underneath running jobs. These build
-    the interface files the kernel would materialise on mkdir."""
+    survive the daemon being restarted underneath running jobs. Isolation the
+    admin asked for and cannot have is refused, never quietly downgraded.
+    These build the interface files the kernel would materialise on mkdir."""
 
     def test_claims_the_configured_subtree(self, tmp_path, monkeypatch):
         fs = fake_cgroup_fs(tmp_path, monkeypatch)
@@ -43,7 +46,8 @@ class TestSetup:
 
         cg = CgroupManager(root=root)
 
-        assert cg.setup() is True
+        cg.setup()
+
         assert cg.controllers == {"cpuset", "memory"}
         assert cg.create(1, cpus=[0], mems=[0], mem_bytes=None) == root / "job-1"
 
@@ -58,7 +62,7 @@ class TestSetup:
         live.mkdir()
         (live / "cpuset.cpus").write_text("12-23")
 
-        assert CgroupManager(root=root).setup() is True
+        CgroupManager(root=root).setup()
 
         assert (live / "cpuset.cpus").read_text() == "12-23"
 
@@ -77,10 +81,10 @@ class TestSetup:
 
         assert list(service.iterdir()) == [service / "cgroup.procs"]
 
-    def test_a_controller_the_kernel_root_withholds_is_skipped(self, tmp_path, monkeypatch, caplog):
-        # Losing cpuset costs NUMA isolation while everything still appears to
-        # work, so it has to be said outright rather than inferred from the
-        # controller list in the ready line.
+    def test_a_withheld_controller_is_refused_not_worked_around(self, tmp_path, monkeypatch):
+        # Without cpuset a job's memory is not confined to its node. Carrying
+        # on would keep every promise except the one that matters, and nothing
+        # in the daemon's behaviour would look wrong.
         fs = fake_cgroup_fs(tmp_path, monkeypatch)
         root = fs / "hpc-batch"
         root.mkdir()
@@ -88,32 +92,27 @@ class TestSetup:
 
         cg = CgroupManager(root=root)
 
-        assert cg.setup() is True
-        assert cg.controllers == {"memory"}
-        assert "NO NUMA ISOLATION" in caplog.text
-
-    def test_a_full_subtree_says_nothing_alarming(self, tmp_path, monkeypatch, caplog):
-        fs = fake_cgroup_fs(tmp_path, monkeypatch)
-        root = fs / "hpc-batch"
-        root.mkdir()
-        (root / "cgroup.controllers").write_text("cpuset memory\n")
-
-        CgroupManager(root=root).setup()
-
-        assert "NO NUMA ISOLATION" not in caplog.text
-
-    def test_without_cgroup_v2_jobs_fall_back_to_affinity(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(cgroup_mod, "CGROUP_FS", tmp_path)  # no cgroup.controllers
-        cg = CgroupManager(root=tmp_path / "hpc-batch")
-
-        assert cg.setup() is False
+        with pytest.raises(CgroupError) as caught:
+            cg.setup()
+        assert "cpuset" in str(caught.value)
+        assert "Delegate=" in str(caught.value)  # names the usual cause
         assert cg.create(1, cpus=[0], mems=[0], mem_bytes=None) is None
 
-    def test_disabled_by_configuration(self, tmp_path):
+    def test_without_cgroup_v2_it_refuses_to_start(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cgroup_mod, "CGROUP_FS", tmp_path)  # no cgroup.controllers
+
+        with pytest.raises(CgroupError) as caught:
+            CgroupManager(root=tmp_path / "hpc-batch").setup()
+        assert "--no-cgroups" in str(caught.value)  # every refusal names the opt-out
+
+    def test_no_cgroups_is_the_way_to_ask_for_the_fallback(self, tmp_path):
         cg = CgroupManager(enabled=False, root=tmp_path / "hpc-batch")
 
-        assert cg.setup() is False
+        cg.setup()  # does not raise
+
+        assert cg.ready is False
         assert not (tmp_path / "hpc-batch").exists()
+        assert cg.create(1, cpus=[0], mems=[0], mem_bytes=None) is None
 
 
 class TestCreate:

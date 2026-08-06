@@ -32,7 +32,7 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 
 from . import __version__
-from .cgroup import CgroupManager
+from .cgroup import CgroupError, CgroupManager
 from .jobs import DONE, QUEUED, RUNNING, Job
 from .protocol import (
     DEFAULT_SOCKET,
@@ -64,6 +64,14 @@ log = logging.getLogger("hpc-batchd")
 TICK_S = 1.0
 KILL_GRACE_S = 10.0
 ATTACH_POLL_S = 0.3
+# EX_CONFIG. Paired with RestartPreventExitStatus= in the unit: a daemon that
+# is misconfigured will be just as misconfigured two seconds later, and a
+# restart loop buries the one log line that says what is wrong.
+EX_CONFIG = 78
+
+
+class StartupError(Exception):
+    """A configuration problem that must be fixed before the daemon can run."""
 
 
 @dataclass
@@ -75,6 +83,7 @@ class Config:
     state_dir: Path
     dev_dir: Path
     use_cgroups: bool
+    use_dev_dir: bool
     schedule: str
     keep_finished: int
     reserve_cpu: int
@@ -148,6 +157,14 @@ def _tidy_gb(gb: float) -> float:
     return math.floor(gb * 100) / 100
 
 
+def _group_exists(name: str) -> bool:
+    try:
+        grp.getgrnam(name)
+    except KeyError:
+        return False
+    return True
+
+
 def peer_creds(sock: socket.socket) -> tuple[int, int, int]:
     """(pid, uid, gid) of the unix-socket peer, from SO_PEERCRED."""
     data = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
@@ -217,7 +234,10 @@ class Daemon:
         os.umask(0o022)
         os.chdir("/")
         self._setup_dirs()
-        self.cgroups.setup()
+        try:
+            self.cgroups.setup()
+        except CgroupError as exc:
+            raise StartupError(str(exc)) from exc
         self._setup_pool()
         self._resolve_admin_gid()
         self._load_state()
@@ -289,11 +309,16 @@ class Daemon:
     def _setup_dirs(self) -> None:
         (self.cfg.state_dir / "jobs").mkdir(parents=True, exist_ok=True)
         self.cfg.socket_path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.cfg.use_dev_dir:
+            return
         try:
             (self.cfg.dev_dir / "jobs").mkdir(parents=True, exist_ok=True)
             self._dev_ok = True
         except OSError as exc:
-            log.warning("cannot create %s (%s); /dev job entries disabled", self.cfg.dev_dir, exc)
+            raise StartupError(
+                f"cannot create {self.cfg.dev_dir} ({exc}); pass --no-dev-dir "
+                f"to run without the job inspection entries"
+            ) from exc
 
     def _setup_pool(self) -> None:
         nodes = discover_numa_nodes()
@@ -329,8 +354,17 @@ class Daemon:
         try:
             self.admin_gid = grp.getgrnam(self.cfg.admin_group).gr_gid
         except KeyError:
-            log.warning("admin group %r does not exist", self.cfg.admin_group)
-            self.admin_gid = None
+            # Warning-and-carry-on left a daemon where nobody but root was an
+            # admin, which shows up only when someone is quietly refused.
+            # "wheel" not existing on Debian is the usual cause.
+            existing = sorted(
+                g for g in ("wheel", "sudo", "adm", "staff")
+                if _group_exists(g)
+            )
+            raise StartupError(
+                f"--admin-group {self.cfg.admin_group!r} does not exist on this "
+                f"system" + (f"; try one of: {', '.join(existing)}" if existing else "")
+            ) from None
 
     # -- state persistence ----------------------------------------------
 
@@ -1016,7 +1050,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--no-cgroups", dest="use_cgroups", action="store_false",
-        help="do not use cgroups (development mode; falls back to cpu affinity)",
+        help="run without cgroups: cpu-affinity pinning only and no enforced "
+             "memory limit. Development mode; without it the daemon refuses to "
+             "start when cgroups are unavailable rather than silently "
+             "dropping the isolation it promises",
+    )
+    parser.add_argument(
+        "--no-dev-dir", dest="use_dev_dir", action="store_false",
+        help="do not create the per-job inspection entries under --dev-dir",
     )
     parser.add_argument(
         "--schedule", choices=MODES, default=FIFO_STRICT, metavar="POLICY",
@@ -1044,6 +1085,9 @@ def main(argv: list[str] | None = None) -> None:
     daemon = Daemon(cfg, saved_args)
     try:
         asyncio.run(daemon.run())
+    except StartupError as exc:
+        log.error("%s", exc)
+        sys.exit(EX_CONFIG)
     except KeyboardInterrupt:
         pass
 

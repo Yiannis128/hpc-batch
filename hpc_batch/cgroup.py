@@ -12,9 +12,12 @@ the service cgroup and the start fails with 219/CGROUP -- for as long as
 any job lives. A separate tree is untouched by anything systemd does to
 the unit, which is what lets a restarted daemon re-adopt running jobs.
 
-Everything degrades gracefully: when cgroups are unavailable (not root,
-no cgroup v2, missing controllers) the daemon falls back to
-sched_setaffinity-only pinning and logs a warning.
+Isolation is all-or-nothing on purpose. If cgroups were asked for and
+cannot be delivered -- no cgroup v2, no root, a controller the root never
+enabled -- setup raises rather than falling back. Jobs would still run
+without them, and nothing would look wrong, which is exactly the problem:
+the memory-locality guarantee this tool exists to make would be quietly
+gone. `--no-cgroups` is how you ask for the fallback on purpose.
 """
 
 import logging
@@ -29,6 +32,12 @@ CGROUP_FS = Path("/sys/fs/cgroup")
 DEFAULT_ROOT = CGROUP_FS / "hpc-batch"
 _WANTED_CONTROLLERS = ("cpuset", "memory")
 
+_NO_CGROUPS = "pass --no-cgroups to run without isolation (development only)"
+
+
+class CgroupError(Exception):
+    """cgroups were asked for and cannot be provided."""
+
 
 class CgroupManager:
     def __init__(self, enabled: bool = True, root: Path = DEFAULT_ROOT):
@@ -37,53 +46,58 @@ class CgroupManager:
         self.ready = False
         self.controllers: set[str] = set()
 
-    def setup(self) -> bool:
-        """Create and claim the job subtree. Returns True when cgroups are
-        usable.
+    def setup(self) -> None:
+        """Create and claim the job subtree, or raise CgroupError saying why
+        it could not be.
 
         Idempotent over an existing tree, because that is the restart case:
         the job cgroups of everything still running are sitting in it, and a
         daemon that has just come back has to adopt them, not disturb them.
         """
         if not self.enabled:
-            log.info("cgroups disabled by configuration")
-            return False
+            log.warning("cgroups disabled (--no-cgroups): jobs get cpu-affinity "
+                        "pinning only, and no memory limit is enforced")
+            return
         if not (CGROUP_FS / "cgroup.controllers").exists():
-            log.warning("cgroup v2 not available; jobs will not be isolated")
-            return False
+            raise CgroupError(
+                f"cgroup v2 is not available at {CGROUP_FS}. This daemon needs a "
+                f"unified cgroup hierarchy; {_NO_CGROUPS}"
+            )
         try:
             self.root.mkdir(exist_ok=True)
-            available = set((self.root / "cgroup.controllers").read_text().split())
-            for ctrl in _WANTED_CONTROLLERS:
-                if ctrl not in available:
-                    log.warning("cgroup controller %r not enabled for %s", ctrl, self.root)
-                    continue
-                try:
-                    (self.root / "cgroup.subtree_control").write_text(f"+{ctrl}")
-                    self.controllers.add(ctrl)
-                except OSError as exc:
-                    log.warning("could not enable cgroup controller %r: %s", ctrl, exc)
         except OSError as exc:
-            log.warning("cgroup setup failed (%s); jobs will not be isolated", exc)
-            return False
+            raise CgroupError(
+                f"cannot create the job cgroup {self.root} ({exc}). The daemon "
+                f"must run as root; {_NO_CGROUPS}"
+            ) from exc
+
+        available = set((self.root / "cgroup.controllers").read_text().split())
+        missing = [c for c in _WANTED_CONTROLLERS if c not in available]
+        if missing:
+            # The controllers reach us from the kernel root, and systemd only
+            # enables one there when a unit asks. Delegate= in our unit is the
+            # ask, which is why deleting it takes cpuset away from a tree that
+            # is not even inside the unit.
+            raise CgroupError(
+                f"the {', '.join(missing)} controller(s) are not available in "
+                f"{self.root}, so jobs cannot be confined to a NUMA node. Check "
+                f"that the unit still has 'Delegate=cpuset memory pids'; "
+                f"{_NO_CGROUPS}"
+            )
+        for ctrl in _WANTED_CONTROLLERS:
+            try:
+                (self.root / "cgroup.subtree_control").write_text(f"+{ctrl}")
+            except OSError as exc:
+                raise CgroupError(
+                    f"could not enable the {ctrl} controller in {self.root} ({exc})"
+                ) from exc
+            self.controllers.add(ctrl)
+
         self.ready = True
         log.info(
             "cgroup subtree %s ready (controllers: %s)",
-            self.root, ", ".join(sorted(self.controllers)) or "none",
+            self.root, ", ".join(sorted(self.controllers)),
         )
-        # Said plainly because the daemon keeps working without it: jobs still
-        # run, still get their cpus, and nothing looks wrong. What is gone is
-        # the guarantee that memory stays on the node those cpus are on, which
-        # is the reason this tool exists. Almost always Delegate= missing from
-        # the unit, which is what makes systemd enable cpuset at the root.
-        if "cpuset" not in self.controllers:
-            log.warning(
-                "NO NUMA ISOLATION: the cpuset controller is not available in "
-                "%s, so jobs fall back to cpu-affinity pinning and their memory "
-                "is not confined to a node. Check that the unit still has "
-                "'Delegate=cpuset memory pids'.", self.root,
-            )
-        return True
 
     def create(
         self,

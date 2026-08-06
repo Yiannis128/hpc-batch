@@ -1,21 +1,20 @@
-# hpc-batch job dispatch daemon.
+# hpc-batch job dispatch daemon. Written here by `hpc-batch-install`, which
+# fills in the daemon path and an admin group that exists on this system.
 #
-# Install:  cp systemd/hpc-batch.service /etc/systemd/system/
-#           systemctl daemon-reload && systemctl enable --now hpc-batch
-#
-# Admin parameters are passed as arguments to hpc-batchd below.
-# After editing them: systemctl daemon-reload && systemctl reload hpc-batch
+# Admin parameters are the arguments to hpc-batchd below; edit them freely.
+# After editing: systemctl daemon-reload && systemctl reload hpc-batch
 # (reload re-execs the daemon in place -- running jobs are NOT killed).
+# Rerunning hpc-batch-install rewrites this file, so keep local changes in a
+# drop-in instead: systemctl edit hpc-batch.
 
 [Unit]
 Description=hpc-batch job dispatch daemon
-Documentation=https://github.com/yiannis/hpc-batch
+Documentation=https://github.com/Yiannis128/hpc-batch
 After=local-fs.target
 
 [Service]
 Type=simple
-# Adjust the path if hpc-batchd was installed elsewhere (e.g. via pipx).
-ExecStart=/usr/local/bin/hpc-batchd --max-lifetime 24h --admin-group wheel
+ExecStart=@HPC_BATCHD@ --max-lifetime 24h --admin-group @ADMIN_GROUP@
 ExecReload=/bin/kill -HUP $MAINPID
 
 # Jobs live in /sys/fs/cgroup/hpc-batch, which the daemon creates and owns,
@@ -43,6 +42,10 @@ StateDirectory=hpc-batch
 
 Restart=on-failure
 RestartSec=2
+# 78 is EX_CONFIG: the daemon refusing to start because it was asked for
+# isolation it cannot deliver. Restarting cannot fix that, and looping buries
+# the one log line that says what is wrong.
+RestartPreventExitStatus=78
 OOMScoreAdjust=-500
 
 [Install]
