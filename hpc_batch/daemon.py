@@ -57,7 +57,7 @@ from .resources import (
     total_memory_gb,
 )
 from .scheduling import FIFO_STRICT, MODES, Reservation, plan
-from .util import duration_arg, format_duration, format_gb
+from .util import ADMIN_GROUPS, duration_arg, format_duration, format_gb, group_exists
 
 log = logging.getLogger("hpc-batchd")
 
@@ -177,14 +177,6 @@ def _validate_env(raw) -> tuple[dict[str, str], str | None]:
     if size > MAX_ENV_BYTES:
         return {}, f"environment is too large ({size} bytes, limit {MAX_ENV_BYTES})"
     return dict(raw), None
-
-
-def _group_exists(name: str) -> bool:
-    try:
-        grp.getgrnam(name)
-    except KeyError:
-        return False
-    return True
 
 
 def peer_creds(sock: socket.socket) -> tuple[int, int, int]:
@@ -350,11 +342,11 @@ class Daemon:
         gpus = discover_gpus()
         node_mem = discover_node_memory_gb(nodes)
         # Memory is only confined to a node when we can actually write
-        # cpuset.mems. Without the cpuset controller (undelegated, or
-        # --no-cgroups) a job can allocate from any node, so track one
-        # machine-wide pool rather than enforcing a split that is not real.
-        # Runs after cgroups.setup(), so the controller set is known.
-        confined = bool(node_mem) and "cpuset" in self.cgroups.controllers
+        # cpuset.mems. Under --no-cgroups a job can allocate from any node, so
+        # track one machine-wide pool rather than enforcing a split that is
+        # not real. Runs after cgroups.setup(), which has already refused to
+        # start if cgroups were wanted and cpuset was missing.
+        confined = bool(node_mem) and self.cgroups.ready
         if not node_mem:
             node_mem = {next(iter(nodes), 0): total_memory_gb()}
         nodes, node_mem = apply_reserve(
@@ -379,13 +371,8 @@ class Daemon:
         try:
             self.admin_gid = grp.getgrnam(self.cfg.admin_group).gr_gid
         except KeyError:
-            # Warning-and-carry-on left a daemon where nobody but root was an
-            # admin, which shows up only when someone is quietly refused.
             # "wheel" not existing on Debian is the usual cause.
-            existing = sorted(
-                g for g in ("wheel", "sudo", "adm", "staff")
-                if _group_exists(g)
-            )
+            existing = sorted(g for g in ADMIN_GROUPS if group_exists(g))
             raise StartupError(
                 f"--admin-group {self.cfg.admin_group!r} does not exist on this "
                 f"system" + (f"; try one of: {', '.join(existing)}" if existing else "")

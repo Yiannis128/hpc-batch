@@ -10,7 +10,6 @@ from pathlib import Path
 import pytest
 
 from hpc_batch.install import (
-    ADMIN_GROUPS,
     DEFAULT_BIN_DIR,
     InstallError,
     detect_admin_group,
@@ -18,6 +17,7 @@ from hpc_batch.install import (
     render_unit,
     unit_template,
 )
+from hpc_batch.util import ADMIN_GROUPS
 
 
 class TestDetectAdminGroup:

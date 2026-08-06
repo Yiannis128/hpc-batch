@@ -31,6 +31,12 @@ class CgroupError(Exception):
     """cgroups were asked for and cannot be provided."""
 
 
+def _refuse(why: str) -> CgroupError:
+    """Every refusal has to name the flag that opts out of it. Built here so
+    that holds by construction rather than by remembering to type it."""
+    return CgroupError(f"{why}; {_NO_CGROUPS}")
+
+
 class CgroupManager:
     def __init__(self, enabled: bool = True, root: Path | None = None):
         self.enabled = enabled
@@ -51,16 +57,16 @@ class CgroupManager:
                         "pinning only, and no memory limit is enforced")
             return
         if not (CGROUP_FS / "cgroup.controllers").exists():
-            raise CgroupError(
+            raise _refuse(
                 f"cgroup v2 is not available at {CGROUP_FS}. This daemon needs a "
-                f"unified cgroup hierarchy; {_NO_CGROUPS}"
+                f"unified cgroup hierarchy"
             )
         try:
             self.root.mkdir(exist_ok=True)
         except OSError as exc:
-            raise CgroupError(
+            raise _refuse(
                 f"cannot create the job cgroup {self.root} ({exc}). The daemon "
-                f"must run as root; {_NO_CGROUPS}"
+                f"must run as root"
             ) from exc
 
         available = set((self.root / "cgroup.controllers").read_text().split())
@@ -70,17 +76,16 @@ class CgroupManager:
             # enables one there when a unit asks. Delegate= in our unit is the
             # ask, which is why deleting it takes cpuset away from a tree that
             # is not even inside the unit.
-            raise CgroupError(
+            raise _refuse(
                 f"the {', '.join(missing)} controller(s) are not available in "
                 f"{self.root}, so jobs cannot be confined to a NUMA node. Check "
-                f"that the unit still has 'Delegate=cpuset memory pids'; "
-                f"{_NO_CGROUPS}"
+                f"that the unit still has 'Delegate=cpuset memory pids'"
             )
         for ctrl in _WANTED_CONTROLLERS:
             try:
                 (self.root / "cgroup.subtree_control").write_text(f"+{ctrl}")
             except OSError as exc:
-                raise CgroupError(
+                raise _refuse(
                     f"could not enable the {ctrl} controller in {self.root} ({exc})"
                 ) from exc
             self.controllers.add(ctrl)
@@ -127,25 +132,23 @@ class CgroupManager:
             return None
         path = self.root / f"job-{job_id}"
         path.mkdir(exist_ok=True)
-        if "cpuset" in self.controllers:
-            (path / "cpuset.cpus").write_text(format_id_list(cpus))
-            (path / "cpuset.mems").write_text(format_id_list(mems))
-        if "memory" in self.controllers:
-            try:
-                # Never let a job swap: swapping would wreck benchmark
-                # timings. A job over its budget should OOM, not thrash.
-                (path / "memory.swap.max").write_text("0")
-            except OSError:
-                pass  # kernel built without swap accounting
-            try:
-                # If one process OOMs, take the whole job down with it. Set
-                # unconditionally: a job left half-dead is a worse outcome
-                # than a clean kill whether or not it named a budget.
-                (path / "memory.oom.group").write_text("1")
-            except OSError:
-                pass
-            if mem_bytes:
-                (path / "memory.max").write_text(str(mem_bytes))
+        (path / "cpuset.cpus").write_text(format_id_list(cpus))
+        (path / "cpuset.mems").write_text(format_id_list(mems))
+        try:
+            # Never let a job swap: swapping would wreck benchmark timings.
+            # A job over its budget should OOM, not thrash.
+            (path / "memory.swap.max").write_text("0")
+        except OSError:
+            pass  # kernel built without swap accounting
+        try:
+            # If one process OOMs, take the whole job down with it. Set
+            # unconditionally: a job left half-dead is a worse outcome than a
+            # clean kill whether or not it named a budget.
+            (path / "memory.oom.group").write_text("1")
+        except OSError:
+            pass
+        if mem_bytes:
+            (path / "memory.max").write_text(str(mem_bytes))
         return path
 
     def oom_killed(self, path: Path) -> bool:

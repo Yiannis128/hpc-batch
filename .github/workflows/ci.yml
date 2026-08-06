@@ -41,18 +41,7 @@ jobs:
       - run: pip install hatch
       - run: hatch build
       - name: The wheel must carry the systemd unit
-        # It did not, until the installer needed it: the package looked fine
-        # and left you with no way to run the service.
-        run: |
-          python - <<'PY'
-          import zipfile, glob, sys
-          wheel = glob.glob("dist/*.whl")[0]
-          names = zipfile.ZipFile(wheel).namelist()
-          missing = [n for n in ["hpc_batch/data/hpc-batch.service"] if n not in names]
-          if missing:
-              sys.exit(f"{wheel} is missing {missing}")
-          print(f"{wheel} carries the unit")
-          PY
+        run: python scripts/check_wheel.py
       - name: The installed entry points must exist and refuse a non-root run
         run: |
           python -m venv /tmp/verify

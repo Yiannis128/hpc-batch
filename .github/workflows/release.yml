@@ -36,21 +36,16 @@ jobs:
         env:
           TAG: ${{ github.event.release.tag_name }}
 
-      - run: pip install . pytest hatch
+      # Build first and test what is about to be published, rather than
+      # letting `pip install .` build a second wheel that is then discarded.
+      - run: pip install hatch
+      - run: hatch build
+      - run: pip install dist/*.whl pytest
       - name: Tests must pass before anything is published
         run: python -m pytest tests -q
-      - run: hatch build
 
       - name: The wheel must carry the systemd unit
-        run: |
-          python - <<'PY'
-          import zipfile, glob, sys
-          wheel = glob.glob("dist/*.whl")[0]
-          names = zipfile.ZipFile(wheel).namelist()
-          if "hpc_batch/data/hpc-batch.service" not in names:
-              sys.exit(f"{wheel} is missing the systemd unit")
-          print(f"{wheel} carries the unit")
-          PY
+        run: python scripts/check_wheel.py
 
       - uses: actions/upload-artifact@v7
         with:

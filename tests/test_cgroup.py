@@ -14,10 +14,10 @@ from hpc_batch import cgroup as cgroup_mod
 from hpc_batch.cgroup import CgroupError, CgroupManager
 
 
-def manager(tmp_path: Path, controllers=("cpuset", "memory")) -> CgroupManager:
+def manager(tmp_path: Path) -> CgroupManager:
     cg = CgroupManager(enabled=True, root=tmp_path)
     cg.ready = True
-    cg.controllers = set(controllers)
+    cg.controllers = {"cpuset", "memory"}
     return cg
 
 
@@ -155,12 +155,6 @@ class TestCreate:
         path = cg.create(10, cpus=[0], mems=[0], mem_bytes=None)
         assert read(path, "memory.oom.group") == "1"
         assert not (path / "memory.max").exists()
-
-    def test_no_cpuset_controller_means_no_cpuset_files(self, tmp_path):
-        cg = manager(tmp_path, controllers=("memory",))
-        path = cg.create(11, cpus=[0], mems=[0], mem_bytes=1 << 30)
-        assert not (path / "cpuset.cpus").exists()
-        assert read(path, "memory.max") == str(1 << 30)
 
     def test_returns_none_before_setup_has_claimed_a_subtree(self, tmp_path):
         cg = CgroupManager(enabled=True)

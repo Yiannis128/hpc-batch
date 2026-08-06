@@ -37,5 +37,5 @@ fi
 
 # Hand over. It links the entry points into /opt/bin, adds that to PATH via
 # /etc/profile.d, writes the unit with an admin group that exists here, and
-# starts the daemon.
-exec "$PREFIX/bin/hpc-batch-install" --prefix "$PREFIX" --spec "$SPEC" "$@"
+# starts the daemon. --already-installed because the pip run above was it.
+exec "$PREFIX/bin/hpc-batch-install" --prefix "$PREFIX" --already-installed "$@"

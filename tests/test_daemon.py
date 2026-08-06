@@ -139,7 +139,7 @@ class TestStartupRefusals:
     def test_it_names_a_group_that_does_exist(self, tmp_path, monkeypatch):
         # The usual cause is `wheel` on a Debian box, where the answer is
         # `sudo`. Saying which groups exist turns a puzzle into a one-word fix.
-        monkeypatch.setattr(daemon_mod, "_group_exists", lambda g: g == "sudo")
+        monkeypatch.setattr(daemon_mod, "group_exists", lambda g: g == "sudo")
         daemon = make_daemon(tmp_path, admin_group="wheel-but-not-on-this-box")
 
         with pytest.raises(StartupError) as caught:

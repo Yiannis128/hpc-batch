@@ -15,7 +15,6 @@ finished and is not.
 """
 
 import argparse
-import grp
 import os
 import re
 import shutil
@@ -24,6 +23,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from .util import ADMIN_GROUPS, group_exists
 
 DEFAULT_PREFIX = Path("/opt/hpc-batch")
 DEFAULT_BIN_DIR = Path("/opt/bin")
@@ -31,23 +31,12 @@ UNIT_PATH = Path("/etc/systemd/system/hpc-batch.service")
 PROFILE_PATH = Path("/etc/profile.d/hpc-batch.sh")
 ENTRY_POINTS = ("dispatch", "hpc-batchd", "hpc-batch-install")
 
-# Distro-dependent, and getting it wrong means nobody but root is an admin.
-ADMIN_GROUPS = ("wheel", "sudo", "adm", "staff")
-
 
 class InstallError(Exception):
     """Something the installer needs is missing or refused."""
 
 
-def _group_exists(name: str) -> bool:
-    try:
-        grp.getgrnam(name)
-    except KeyError:
-        return False
-    return True
-
-
-def detect_admin_group(exists=_group_exists) -> str:
+def detect_admin_group(exists=group_exists) -> str:
     """First of the usual admin groups that exists here.
 
     Debian calls it `sudo`, Fedora and Arch call it `wheel`. Hard-coding
@@ -133,8 +122,9 @@ def install(args: argparse.Namespace) -> None:
     _check_preconditions()
     admin_group = args.admin_group or detect_admin_group()
 
-    pip = _make_venv(args.prefix)
-    _run([str(pip), "install", "--upgrade", args.spec], f"install {args.spec}")
+    if not args.already_installed:
+        pip = _make_venv(args.prefix)
+        _run([str(pip), "install", "--upgrade", args.spec], f"install {args.spec}")
 
     args.bin_dir.mkdir(parents=True, exist_ok=True)
     for name in ENTRY_POINTS:
@@ -210,6 +200,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "checkout (default: hpc-batch, from PyPI)")
     parser.add_argument("--no-start", action="store_true",
                         help="install everything but leave the service stopped")
+    parser.add_argument("--already-installed", action="store_true",
+                        help="skip the venv and pip step because the caller has "
+                             "just done it (install.sh, which has to install the "
+                             "package before this command exists to run)")
     parser.add_argument("--uninstall", action="store_true",
                         help="remove the unit, the entry points and the "
                              "virtualenv, keeping job state")
