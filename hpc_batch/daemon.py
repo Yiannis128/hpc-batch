@@ -64,6 +64,9 @@ log = logging.getLogger("hpc-batchd")
 TICK_S = 1.0
 KILL_GRACE_S = 10.0
 ATTACH_POLL_S = 0.3
+# A queued job's --env is held in the state file until it starts, so it has to
+# be bounded. Kept under MAX_LINE so an oversized one is rejected with a reason
+# instead of killing the connection.
 MAX_ENV_BYTES = 256 * 1024
 
 
@@ -149,25 +152,18 @@ def _tidy_gb(gb: float) -> float:
     return math.floor(gb * 100) / 100
 
 
-def _validate_env(raw) -> tuple[dict[str, str], str | None]:
-    """Check a submitted --env payload. Returns (env, error).
-
-    Bounded because it is stored and replayed: a queued job keeps its
-    environment across a daemon restart, and an unbounded one would sit in
-    the state file forever. The cap is well under the protocol's frame
-    limit, so an oversized environment is rejected with a reason rather than
-    killing the connection.
-    """
-    if raw is None:
-        return {}, None
-    if not isinstance(raw, dict) or not all(
-        isinstance(k, str) and isinstance(v, str) for k, v in raw.items()
-    ):
-        return {}, "env must be a mapping of strings to strings"
-    size = sum(len(k) + len(v) + 2 for k, v in raw.items())
+def _env_problem(env) -> str | None:
+    """Why a submitted --env payload is unusable, or None if it is fine."""
+    if not isinstance(env, dict):
+        return "env must be a mapping of strings to strings"
+    size = 0
+    for k, v in env.items():
+        if not (isinstance(k, str) and isinstance(v, str)):
+            return "env must be a mapping of strings to strings"
+        size += len(k) + len(v) + 2
     if size > MAX_ENV_BYTES:
-        return {}, f"environment is too large ({size} bytes, limit {MAX_ENV_BYTES})"
-    return dict(raw), None
+        return f"environment is too large ({size} bytes, limit {MAX_ENV_BYTES})"
+    return None
 
 
 def peer_creds(sock: socket.socket) -> tuple[int, int, int]:
@@ -396,9 +392,7 @@ class Daemon:
         }
         tmp = self.state_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=1))
-        # Root-only: this file holds every user's jobs, and with --env that
-        # includes whatever secrets were in the environment they submitted
-        # from. The default 0644 would publish them to the whole machine.
+        # Holds every user's jobs, and with --env their secrets: not 0644.
         os.chmod(tmp, 0o600)
         os.replace(tmp, self.state_file)
         self._dirty = False
@@ -427,8 +421,10 @@ class Daemon:
 
     def _write_info(self, job: Job) -> None:
         info = self.job_dir(job.id) / "info.json"
+        data = job.to_dict()
+        data.pop("env")  # readable by admins; only the root-only state file replays it
         try:
-            info.write_text(json.dumps(job.to_dict(), indent=1) + "\n")
+            info.write_text(json.dumps(data, indent=1) + "\n")
             self._own_job_path(info, job, 0o640)
         except OSError as exc:
             log.warning("could not write info for job %d: %s", job.id, exc)
@@ -522,7 +518,8 @@ class Daemon:
             if problem:
                 return err(f"cannot save output there: {problem}")
 
-        env, problem = _validate_env(req.get("env"))
+        env = req.get("env") or {}
+        problem = _env_problem(env)
         if problem:
             return err(problem)
 
@@ -657,6 +654,10 @@ class Daemon:
         job.mem_by_node = dict(alloc.mem_by_node)
         job.gpus = list(alloc.gpus)
         job.cgroup = str(cg) if cg is not None else None
+        # Only a queued job needs it; a re-adopted one is never re-spawned.
+        # Keeping it would persist the submitter's secrets for the job's whole
+        # retained life, and rewrite them on every state change.
+        job.env = {}
         self._job_changed(job)
         log.info(
             "job %d started (pid %d, node %s, cpus %s%s, mem nodes %s%s)",
@@ -669,27 +670,22 @@ class Daemon:
         )
 
     def _job_env(self, job: Job, pw: pwd.struct_passwd, alloc: Allocation) -> dict[str, str]:
-        """The environment a job runs with: clean by default, the submitter's
-        own when they passed --env.
-
-        The last block is not overridable on purpose. CUDA_VISIBLE_DEVICES is
-        the whole of a job's gpu isolation, so a forwarded one letting a user
-        reach cards they were not allocated would be a way through it.
-        """
-        env = dict(job.env)
-        env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
-        env.setdefault("LANG", os.environ.get("LANG", "C.UTF-8"))
-        env.update({
+        defaults = {
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+        }
+        ours = {
             "HOME": pw.pw_dir,
             "USER": pw.pw_name,
             "LOGNAME": pw.pw_name,
             "SHELL": pw.pw_shell or "/bin/sh",
             "HPC_BATCH_JOB_ID": str(job.id),
-        })
+        }
         if self.pool.gpu_ids:
-            # Empty string for 0-gpu jobs: they must not see any gpu.
-            env["CUDA_VISIBLE_DEVICES"] = format_id_list(alloc.gpus)
-        return env
+            # A forwarded one must never win: this is the whole of a job's gpu
+            # isolation. Empty string for 0-gpu jobs, which must see no gpu.
+            ours["CUDA_VISIBLE_DEVICES"] = format_id_list(alloc.gpus)
+        return defaults | job.env | ours
 
     def _write_output_line(self, job: Job, text: str) -> None:
         with contextlib.suppress(OSError):

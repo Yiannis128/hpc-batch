@@ -234,11 +234,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="kill the job after this long, e.g. 30m or 2h "
                             "(default and upper bound: the admin's max lifetime)")
     p_new.add_argument("--env", action="store_true",
-                       help="run the job with your current environment. "
-                            "Without this it gets a clean one (PATH, HOME, "
-                            "USER, SHELL, LANG). HPC_BATCH_JOB_ID and "
-                            "CUDA_VISIBLE_DEVICES are always set by the "
-                            "daemon and cannot be overridden")
+                       help="run the job with your current environment instead of a "
+                            "clean one; the daemon's own variables still win")
     p_new.add_argument("--exclusive", action="store_true",
                        help="run alone: wait for an idle machine and block others while running")
     p_new.add_argument("--output", default=None, metavar="PATH",
