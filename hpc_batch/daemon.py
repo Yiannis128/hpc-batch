@@ -47,9 +47,11 @@ from .protocol import (
 )
 from .resources import (
     Allocation,
+    GpuTopology,
     Request,
     ResourcePool,
     apply_reserve,
+    discover_gpu_topology,
     discover_gpus,
     discover_node_memory_gb,
     discover_numa_nodes,
@@ -159,6 +161,13 @@ def _tidy_gb(gb: float) -> float:
     limit it was computed from.
     """
     return math.floor(gb * 100) / 100
+
+
+def _gpu_note(gpus: list[int], link: str | None) -> str:
+    """The gpus a job got, and the link class pacing them when known."""
+    if not gpus:
+        return ""
+    return f", gpus {format_id_list(gpus)}" + (f" over {link}" if link else "")
 
 
 def _env_problem(env) -> str | None:
@@ -336,6 +345,7 @@ class Daemon:
     def _setup_pool(self) -> None:
         nodes = discover_numa_nodes()
         gpus = discover_gpus()
+        topology = discover_gpu_topology() if gpus else GpuTopology()
         node_mem = discover_node_memory_gb(nodes)
         # Memory is only confined to a node when we can actually write
         # cpuset.mems. Under --no-cgroups a job can allocate from any node, so
@@ -349,8 +359,14 @@ class Daemon:
             nodes, node_mem, self.cfg.reserve_cpu, self.cfg.reserve_mem
         )
         self.pool = ResourcePool(
-            node_cpus=nodes, gpu_ids=gpus, node_mem_gb=node_mem, mem_confined=confined
+            node_cpus=nodes, gpu_ids=gpus, node_mem_gb=node_mem, mem_confined=confined,
+            gpu_topology=topology,
         )
+        if len(gpus) > 1 and not topology:
+            log.warning(
+                "gpu topology unavailable (nvidia-smi topo -m); multi-gpu jobs will "
+                "get the lowest free indices, which can straddle the interconnect"
+            )
         log.info(
             "resources available to jobs: %d cpus over %d NUMA node(s), %d gpu(s), "
             "%.0f GiB memory (%s); reserved for the system: %d cpu, %g GiB",
@@ -500,7 +516,9 @@ class Daemon:
             time_raw = req.get("max_time_s")
             requested = int(time_raw) if time_raw is not None else None
             exclusive = bool(req.get("exclusive"))
-            numa_local = bool(req.get("numa_local"))
+            numa_local_mem = bool(req.get("numa_local_mem"))
+            numa_local_gpu = bool(req.get("numa_local_gpu"))
+            min_gpu_link = req.get("min_gpu_link") or None
             # An exclusive job owns the machine, so "unspecified" means all
             # of it rather than a single core.
             default_cpu = self.pool.total_cpus() if exclusive else 1
@@ -520,7 +538,8 @@ class Daemon:
             mem_gb = self._default_mem_gb(cpu, exclusive)
 
         problem = self.pool.validate(
-            Request(cpu, gpu_cores, mem_gb, exclusive, numa_local)
+            Request(cpu, gpu_cores, mem_gb, exclusive, numa_local_mem,
+                    numa_local_gpu, min_gpu_link)
         )
         if problem:
             return err(problem)
@@ -556,7 +575,9 @@ class Daemon:
             max_mem_gb=mem_gb,
             max_time_s=max_time,
             exclusive=exclusive,
-            numa_local=numa_local,
+            numa_local_mem=numa_local_mem,
+            numa_local_gpu=numa_local_gpu,
+            min_gpu_link=min_gpu_link,
             env=env,
             mem_defaulted=mem_defaulted,
             submit_time=time.time(),
@@ -573,7 +594,11 @@ class Daemon:
             " default" if mem_defaulted else "",
             format_duration(max_time),
             " exclusive" if exclusive else "",
-            " numa-local" if numa_local else "",
+            "".join(
+                f" numa-local-{what}"
+                for what, on in (("mem", numa_local_mem), ("gpu", numa_local_gpu))
+                if on
+            ),
         )
         self._schedule()
         self._persist()
@@ -674,6 +699,9 @@ class Daemon:
         job.numa_nodes = list(alloc.numa_nodes)
         job.mem_by_node = dict(alloc.mem_by_node)
         job.gpus = list(alloc.gpus)
+        # Recorded now rather than derived on demand: `dispatch list` has no
+        # topology, and a reload could hand it a different one.
+        job.gpu_link = self.pool.gpu_topology.worst_link(alloc.gpus)
         job.cgroup = str(cg) if cg is not None else None
         # Only a queued job needs it; a re-adopted one is never re-spawned.
         # Keeping it would persist the submitter's secrets for the job's whole
@@ -685,7 +713,7 @@ class Daemon:
             job.id, job.pid,
             format_id_list(alloc.numa_nodes),
             format_id_list(alloc.cpus),
-            f", gpus {format_id_list(alloc.gpus)}" if alloc.gpus else "",
+            _gpu_note(alloc.gpus, job.gpu_link),
             format_id_list(alloc.mem_nodes()),
             " (spans nodes: remote memory is slower)" if alloc.spans_nodes else "",
         )

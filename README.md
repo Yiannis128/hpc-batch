@@ -35,7 +35,7 @@ and benchmark timings are stable.
   no single node is spread across nodes instead of waiting; the extra nodes
   go into `cpuset.mems`, so the job can never allocate where nobody
   budgeted for it. Access to the remote part is slower, so `dispatch list`
-  marks those jobs with `+` and `--numa-local` refuses to spread at all,
+  marks those jobs with `+` and `--numa-local-mem` refuses to spread at all,
   waiting for a node that fits the whole budget. Under `--no-cgroups` a job
   really can allocate anywhere, and the daemon tracks one machine-wide pool
   instead; the startup log line says which mode is in force. Without that
@@ -43,6 +43,47 @@ and benchmark timings are stable.
 - **GPUs**: `--gpu-cores N` allocates N of the GPUs enumerated by
   `nvidia-smi -L`; the job sees them via `CUDA_VISIBLE_DEVICES` (jobs that
   requested no GPUs get an empty `CUDA_VISIBLE_DEVICES`).
+- **Which GPUs is not arbitrary.** A multi-GPU job gets the
+  closest-connected free set in the interconnect that `nvidia-smi topo -m`
+  reports, not the lowest free indices: with GPU1 busy, index order hands a
+  2-GPU job GPU0+GPU2 across the machine even when GPU2+GPU3 share an
+  NVLink. A set is judged by its worst link first, because a collective runs
+  at the speed of its slowest pair, and the job's cpus then come from the
+  NUMA node its GPUs hang off. Adjacency is a preference and never a reason
+  to keep a job queued: when only distant GPUs are free the job takes them,
+  and the line logged at start-up names the link class it ended up with.
+  Where `nvidia-smi topo -m` is unavailable the daemon says so at startup and
+  falls back to index order.
+- **GPUs are spent worst-first.** Each level of the interconnect divides the
+  free GPUs into islands — what sits behind one switch, one host bridge, one
+  socket — and a job goes in the finest island that can hold it. When several
+  would serve it equally well it takes from the one with least left to give,
+  so a 2-GPU job carves into a quad that is already broken instead of
+  splitting an intact one and leaving nothing for the job behind it that
+  needs four. Same best-fit reasoning the CPU nodes get.
+- **`--numa-local-gpu` makes that a requirement.** By default a job takes
+  distant GPUs rather than queue. With the flag it waits instead: every GPU
+  it gets has to hang off one NUMA node, and its cpus come from that node, so
+  nothing it does crosses the interconnect. A request no single node could
+  ever hold is refused at submit time rather than queued forever, as is one
+  on a machine where `nvidia-smi topo -m` does not say which node a GPU
+  belongs to. `--numa-local` turns this on together with `--numa-local-mem`,
+  which is the way to ask for a job that is local in every respect.
+- **`--gpu-link CLASS` names the worst wiring you will accept**, out of `NV`,
+  `PIX`, `PXB`, `PHB` and `NODE` (closest first, as `nvidia-smi topo -m`
+  names them); anything worse and the job waits. This is a finer thing than
+  NUMA locality, and not implied by it: `NODE` is by definition a hop between
+  PCIe host bridges *within* one NUMA node, so `--numa-local-gpu` alone can
+  still hand you a pair whose peer-to-peer copies are staged through host
+  memory rather than going card to card. `--gpu-link PXB` keeps a set inside
+  one host bridge, where they are not; `--gpu-link NV` demands NVLink, for a
+  job whose collectives are what it is measuring. Asking for more GPUs than
+  the machine wires that closely is refused at submit time.
+- **`dispatch list` shows what a job got.** The `GPU` column gives the count
+  and the link class pacing them, `!` marking a set that reaches across a
+  host bridge or the socket interconnect, with the same footnote treatment as
+  the `+` on spread memory. The column is only shown when some job in the
+  listing has GPUs at all.
 - **/dev/hpc-batch/jobs/**: every queued/running job appears as
   `/dev/hpc-batch/jobs/<id>` (a symlink to its state directory) containing
   `info.json` (metadata) and `output` (combined stdout/stderr). Entries are
@@ -234,7 +275,15 @@ dispatch new --exclusive -- ./timing_sensitive_bench
 
 # Insist on memory local to the job's own NUMA node, waiting for a node that
 # fits rather than spreading the budget across nodes:
-dispatch new --cpu 4 --max-mem 64 --numa-local -- ./latency_sensitive_bench
+dispatch new --cpu 4 --max-mem 64 --numa-local-mem -- ./latency_sensitive_bench
+
+# Keep the whole job on one node, memory and gpus alike, waiting for a node
+# that can hold all of it rather than reaching across the interconnect:
+dispatch new --cpu 8 --gpu-cores 2 --max-mem 64 --numa-local -- ./collective_bench
+
+# Measuring collectives: wait for gpus that share an NVLink, rather than run
+# on whatever is free and get numbers paced by PCIe:
+dispatch new --cpu 8 --gpu-cores 4 --gpu-link NV -- ./allreduce_bench
 
 # List my jobs / all jobs (all = admins, or everyone with --list-is-public):
 dispatch list

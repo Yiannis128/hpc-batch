@@ -13,32 +13,79 @@ Placement therefore works like this:
 - It does not fit any single node: the charge is spread across nodes, home
   node first, and `cpuset.mems` lists exactly those nodes. Access to the
   spilled part is slower, so this is reported rather than done silently.
-- ``numa_local`` forbids the second case: the job waits for a node that can
-  hold the whole budget locally.
+- ``numa_local_mem`` forbids the second case: the job waits for a node that
+  can hold the whole budget locally.
 - ``exclusive`` owns the machine, so it takes cores from every node and may
   use all of the memory.
+
+``numa_local_gpu`` is the same bargain for GPUs: every GPU the job gets has
+to hang off one node, and its cpus come from that node, so nothing it does
+crosses the interconnect. A job that asks for it waits rather than take a
+placement that spans nodes. Both flags are what `dispatch new --numa-local`
+turns on together.
 
 Because every job is charged to exactly the nodes in its `cpuset.mems`, the
 books and the kernel can never disagree about where a job's memory lives.
 When we cannot set `cpuset.mems` at all (no cpuset controller, or
 `--no-cgroups`) a job really can allocate anywhere, and the pool tracks one
 machine-wide domain instead of pretending otherwise.
+
+GPUs follow the same principle. A multi-GPU job's devices talk to each
+other, and taking the lowest free indices hands it a pair on opposite sides
+of the machine whenever the index between them is busy. So the pool hands
+out the closest-connected free set that `nvidia-smi topo -m` describes, and
+puts the job's cpus on the NUMA node those GPUs hang off. Where that file
+tells us nothing, GPU choice is index order, as it was before.
+
+Closest is found by walking the machine's own structure rather than by
+scoring every combination of GPUs. Each level of the interconnect cuts the
+free GPUs into islands — the GPUs behind one switch, one host bridge, one
+socket — and a job is placed in the finest island that can hold it, because
+a better set would have to be a whole island one level down, where there was
+none big enough. Which island, when several would do, is a best-fit decision
+exactly like the one CPU nodes get: take from the island with least left to
+give, so that whole islands stay whole for the jobs that need one.
 """
 
 import copy
+import itertools
 import logging
+import math
 import os
 import re
 import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
+from typing import NamedTuple
 
 log = logging.getLogger(__name__)
 
 _NODE_DIR = Path("/sys/devices/system/node")
 _GPU_LINE = re.compile(r"^GPU (\d+):")
+_GPU_NAME = re.compile(r"^GPU(\d+)$")
+_NVLINK = re.compile(r"^NV(\d+)$")
 _MEMTOTAL_LINE = re.compile(r"^Node \d+ MemTotal:\s+(\d+) kB")
+
+#: Link classes from the legend of `nvidia-smi topo -m`, closest first.
+_LINK_CLASSES = ("NV", "PIX", "PXB", "PHB", "NODE", "SYS")
+
+#: What `--gpu-link` accepts. SYS is left out: it is the worst class there is,
+#: so demanding it would rule nothing out.
+GPU_LINK_CHOICES = _LINK_CLASSES[:-1]
+
+#: Classes where the GPUs have left their own PCIe tree, so a peer-to-peer
+#: copy between them is staged through host memory instead of going card to
+#: card. `dispatch list` marks these.
+REMOTE_GPU_LINKS = _LINK_CLASSES[_LINK_CLASSES.index("PHB"):]
+
+#: Links we will score to choose between the GPU sets one island offers. Past
+#: this the island is taken apart into the finer ones inside it instead, which
+#: is both cheaper and what the answer looks like anyway at that width. No
+#: island of a real machine comes close: it is reached only by a topology with
+#: no structure to take apart.
+_MAX_GPU_LINK_SCANS = 20_000
 
 #: Memory-domain key used when jobs are not confined to one node's memory.
 SHARED_MEM = -1
@@ -148,22 +195,174 @@ def apply_reserve(
     return cpus, mem
 
 
-def discover_gpus() -> list[int]:
-    """GPU indices reported by `nvidia-smi -L`; empty when unavailable."""
+def _nvidia_smi(*args: str) -> str:
+    """Output of an `nvidia-smi` query, or "" if it cannot be asked."""
     try:
         out = subprocess.run(
-            ["nvidia-smi", "-L"], capture_output=True, text=True, timeout=15
+            ["nvidia-smi", *args], capture_output=True, text=True, timeout=15
         )
     except (OSError, subprocess.TimeoutExpired):
-        return []
-    if out.returncode != 0:
-        return []
+        return ""
+    return out.stdout if out.returncode == 0 else ""
+
+
+def discover_gpus() -> list[int]:
+    """GPU indices reported by `nvidia-smi -L`; empty when unavailable."""
     gpus = []
-    for line in out.stdout.splitlines():
+    for line in _nvidia_smi("-L").splitlines():
         match = _GPU_LINE.match(line.strip())
         if match:
             gpus.append(int(match.group(1)))
     return gpus
+
+
+@lru_cache(maxsize=None)
+def _link_rank(label: str | None) -> int:
+    """How far apart a link class puts two GPUs, closest = 0.
+
+    Anything we do not recognise — a missing entry, a class from a newer
+    driver — sorts last, so a pair we know nothing about is never preferred
+    to one we do.
+    """
+    if label and _NVLINK.match(label):
+        label = "NV"
+    return _LINK_CLASSES.index(label) if label in _LINK_CLASSES else len(_LINK_CLASSES)
+
+
+@lru_cache(maxsize=None)
+def _nvlink_width(label: str | None) -> int:
+    """Number of bonded NVLinks a label describes; 0 if it is not NVLink."""
+    match = _NVLINK.match(label or "")
+    return int(match.group(1)) if match else 0
+
+
+class LinkQuality(NamedTuple):
+    """A set of GPUs scored as a group, in the order the fields are compared."""
+
+    worst: int  # rank of the link pacing the set
+    total: int  # every pair's rank, summed
+    width: int  # NVLink lanes, negated so that more of them sorts first
+
+
+@dataclass(frozen=True)
+class GpuTopology:
+    """The link class between each pair of GPUs, and the NUMA node each one
+    hangs off.
+
+    Empty when `nvidia-smi topo -m` is unavailable or unreadable; every
+    method then answers "no idea".
+    """
+
+    links: dict[tuple[int, int], str] = field(default_factory=dict)
+    numa_node: dict[int, int] = field(default_factory=dict)
+
+    def __bool__(self) -> bool:
+        return bool(self.links or self.numa_node)
+
+    def __deepcopy__(self, memo) -> "GpuTopology":
+        # Shared, not copied: the machine's wiring cannot change under us,
+        # and ResourcePool.clone() deep-copies the pool on every tick.
+        return self
+
+    def link(self, a: int, b: int) -> str | None:
+        return self.links.get((min(a, b), max(a, b)))
+
+    def _pairs(self, gpus: Iterable[int]) -> list[str | None]:
+        return [self.link(a, b) for a, b in itertools.combinations(sorted(gpus), 2)]
+
+    def quality(self, gpus: Iterable[int]) -> "LinkQuality":
+        """How good a set of GPUs is as a group, best first.
+
+        The worst link leads because a collective runs at the speed of its
+        slowest pair: four NVLinked GPUs and one across the machine is a
+        five-GPU job bound by that one hop.
+        """
+        pairs = self._pairs(gpus)
+        ranks = [_link_rank(link) for link in pairs]
+        return LinkQuality(
+            worst=max(ranks, default=0),
+            total=sum(ranks),
+            width=-sum(_nvlink_width(link) for link in pairs),
+        )
+
+    def islands(self, gpus: Iterable[int], level: int) -> list[list[int]]:
+        """``gpus`` split into groups joined by links no worse than ``level``.
+
+        For the PCIe classes this is the machine's own structure: a GPU sits
+        under a switch, under a host bridge, under a socket, so "no worse than
+        L" is transitive and the groups are exactly those units. NVLink is a
+        mesh and not a hierarchy — on a DGX-1 all eight GPUs are one NVLinked
+        group but only its quads are wired pairwise — so a group is somewhere
+        the answer may be, never proof that the answer is the whole group.
+        """
+        rest = sorted(gpus)
+        groups: list[list[int]] = []
+        while rest:
+            group = [rest.pop(0)]
+            frontier = list(group)
+            while frontier:
+                gpu = frontier.pop()
+                joined = [g for g in rest if _link_rank(self.link(gpu, g)) <= level]
+                for g in joined:
+                    rest.remove(g)
+                group += joined
+                frontier += joined
+            groups.append(sorted(group))
+        return groups
+
+    def worst_link(self, gpus: Iterable[int]) -> str | None:
+        """The link class pacing this set. None when it has no pair, or none
+        we know anything about."""
+        return max((p for p in self._pairs(gpus) if p), key=_link_rank, default=None)
+
+    def nodes_for(self, gpus: Iterable[int]) -> set[int]:
+        """The NUMA nodes these GPUs hang off; empty when unknown."""
+        return {self.numa_node[g] for g in gpus if g in self.numa_node}
+
+
+def parse_gpu_topology(text: str) -> GpuTopology:
+    """Read the matrix printed by `nvidia-smi topo -m`.
+
+    Only the header says how wide the matrix is, and it has to: on a machine
+    with InfiniBand the NICs get columns too, and without the width a row's
+    trailing affinity fields are indistinguishable from its links. The header
+    is the indented line; rows start flush left with the device name.
+    """
+    lines = text.splitlines()
+    header = next(
+        (line for line in lines if line[:1].isspace() and line.strip().startswith("GPU")),
+        None,
+    )
+    if header is None:
+        return GpuTopology()
+    columns = header.split()
+    if "CPU" in columns:
+        columns = columns[: columns.index("CPU")]  # "CPU Affinity" and what follows
+
+    links: dict[tuple[int, int], str] = {}
+    numa: dict[int, int] = {}
+    for line in lines:
+        if line[:1].isspace():
+            continue
+        cells = line.split()
+        match = _GPU_NAME.match(cells[0]) if cells else None
+        if match is None:
+            continue
+        row = int(match.group(1))
+        for name, label in zip(columns, cells[1 : 1 + len(columns)]):
+            col = _GPU_NAME.match(name)
+            if col and int(col.group(1)) != row:
+                pair = (min(row, int(col.group(1))), max(row, int(col.group(1))))
+                links[pair] = label
+        affinity = cells[1 + len(columns):]  # CPU affinity, then NUMA affinity
+        if len(affinity) > 1 and affinity[1].isdigit():
+            numa[row] = int(affinity[1])
+    return GpuTopology(links=links, numa_node=numa)
+
+
+def discover_gpu_topology() -> GpuTopology:
+    """GPU interconnect per `nvidia-smi topo -m`; empty when unavailable."""
+    return parse_gpu_topology(_nvidia_smi("topo", "-m"))
 
 
 def total_memory_gb() -> float:
@@ -193,7 +392,9 @@ class Request:
     gpu_cores: int = 0
     mem_gb: float | None = None
     exclusive: bool = False
-    numa_local: bool = False
+    numa_local_mem: bool = False
+    numa_local_gpu: bool = False
+    min_gpu_link: str | None = None  # worst link class the job will accept
 
 
 @dataclass
@@ -242,6 +443,7 @@ class ResourcePool:
     gpu_ids: list[int]
     node_mem_gb: dict[int, float]
     mem_confined: bool = True
+    gpu_topology: GpuTopology = field(default_factory=GpuTopology)
     free_cpus: dict[int, set[int]] = field(init=False)
     free_gpus: set[int] = field(init=False)
     mem_capacity: dict[int, float] = field(init=False)
@@ -291,6 +493,18 @@ class ResourcePool:
     def total_cpus(self) -> int:
         return sum(len(cpus) for cpus in self.node_cpus.values())
 
+    def gpus_by_node(self, gpus: Iterable[int] | None = None) -> dict[int, list[int]]:
+        """GPUs grouped by the NUMA node they hang off, the whole machine's by
+        default. Empty when the topology does not say, which is what makes
+        --numa-local-gpu unenforceable rather than merely unavailable."""
+        grouping = self.gpu_ids if gpus is None else gpus
+        by_node: dict[int, list[int]] = {}
+        for gpu in grouping:
+            node = self.gpu_topology.numa_node.get(gpu)
+            if node is not None:
+                by_node.setdefault(node, []).append(gpu)
+        return by_node
+
     def proportional_share(self, cpu: int) -> float:
         """The memory ``cpu`` cores are worth, on the least generous node.
 
@@ -332,15 +546,46 @@ class ResourcePool:
                 )
         if req.gpu_cores > len(self.gpu_ids):
             return f"--gpu-cores {req.gpu_cores} exceeds the {len(self.gpu_ids)} gpus on this machine"
+        if req.min_gpu_link and req.gpu_cores > 1:
+            if not self.gpu_topology:
+                return (
+                    f"--gpu-link {req.min_gpu_link} needs the wiring that "
+                    "`nvidia-smi topo -m` reports, and this machine does not give it"
+                )
+            # Only a group already joined at that class can hold such a set, so
+            # the widest one is the ceiling. Being wide enough does not prove a
+            # set exists inside it — NVLink is a mesh — so a request that fits
+            # here can still have to wait.
+            level = _link_rank(req.min_gpu_link)
+            widest = max(len(i) for i in self.gpu_topology.islands(self.gpu_ids, level))
+            if req.gpu_cores > widest:
+                return (
+                    f"--gpu-cores {req.gpu_cores} exceeds the {widest} gpus this "
+                    f"machine connects at {req.min_gpu_link} or better"
+                )
+        if req.numa_local_gpu and req.gpu_cores:
+            per_node = self.gpus_by_node()
+            if not per_node:
+                return (
+                    "--numa-local-gpu needs to know which NUMA node each gpu hangs "
+                    "off, and `nvidia-smi topo -m` does not say on this machine"
+                )
+            biggest = max(len(gpus) for gpus in per_node.values())
+            if req.gpu_cores > biggest:
+                return (
+                    f"--gpu-cores {req.gpu_cores} exceeds the {biggest} gpus on one "
+                    "NUMA node, and --numa-local-gpu keeps a job's gpus on one node; "
+                    "drop it to let them span nodes"
+                )
         if req.mem_gb is not None and self.tracks_memory:
-            if req.numa_local:
+            if req.numa_local_mem:
                 ceiling = self.largest_node_mem_gb()
                 if req.mem_gb > ceiling + _EPS:
                     return (
                         f"--max-mem {req.mem_gb:g} exceeds the largest NUMA node "
-                        f"({ceiling:.0f} GiB) and --numa-local keeps a job on one "
-                        "node; drop --numa-local to let the budget span nodes, or "
-                        "use --exclusive"
+                        f"({ceiling:.0f} GiB) and --numa-local-mem keeps a job on one "
+                        "node; drop it to let the budget span nodes, or use "
+                        "--exclusive"
                     )
             else:
                 ceiling = self.usable_mem_gb()
@@ -367,10 +612,16 @@ class ResourcePool:
         here: if they disagreed, a job could pass submission and then never be
         placed.
         """
-        return len(self.node_cpus) if req.exclusive and not req.numa_local else 1
+        confined = req.numa_local_mem or (req.numa_local_gpu and req.gpu_cores > 0)
+        return len(self.node_cpus) if req.exclusive and not confined else 1
 
-    def _cpu_node_order(self, req: Request, only: int | None, max_nodes: int) -> list[int]:
-        """The nodes to draw cpus from, best first. Empty means no placement."""
+    def _cpu_node_order(
+        self, req: Request, only: int | None, max_nodes: int, near: set[int]
+    ) -> list[int]:
+        """The nodes to draw cpus from, best first. Empty means no placement.
+
+        ``near`` are the nodes this job's devices already sit on, if any.
+        """
         candidates = [n for n in self.free_cpus if only is None or n == only]
         if max_nodes > 1:
             # Spanning the machine: there is no one else to keep a node free
@@ -380,20 +631,26 @@ class ResourcePool:
         whole = [n for n in candidates if len(self.free_cpus[n]) >= req.cpu]
         local = [n for n in whole if self._fits_locally(n, req.mem_gb)]
         if local:
-            # Best fit: fewest free cpus, then least free memory, keeping
-            # roomier nodes available for bigger jobs. Node id breaks ties so
-            # placement stays deterministic.
-            return sorted(local, key=lambda n: (len(self.free_cpus[n]), self._free_mem(n), n))
-        if req.numa_local:
+            # A node the job's own devices sit on leads: everything it feeds
+            # them crosses the interconnect otherwise. Then best fit — fewest
+            # free cpus, then least free memory — which keeps roomier nodes
+            # available for bigger jobs. Node id breaks ties so placement stays
+            # deterministic.
+            return sorted(
+                local,
+                key=lambda n: (n not in near, len(self.free_cpus[n]), self._free_mem(n), n),
+            )
+        if req.numa_local_mem:
             return []
-        # The budget has to span nodes. Here memory leads and cpu best-fit
-        # only breaks ties: this job is already going to pay for remote
-        # access, so the node with the most free memory keeps that bill as
-        # small as possible. Whether it fits at all is _charge_plan's call.
+        # The budget has to span nodes. Here memory leads, ahead of even
+        # ``near``: this job is already going to pay for remote access, so the
+        # node with the most free memory keeps that bill as small as possible,
+        # and cpu best-fit only breaks ties. Whether it fits at all is
+        # _charge_plan's call.
         return sorted(whole, key=lambda n: (-self._free_mem(n), len(self.free_cpus[n]), n))
 
     def _pick_cpus(
-        self, req: Request, only: int | None, max_nodes: int
+        self, req: Request, only: int | None, max_nodes: int, near: set[int]
     ) -> tuple[list[int], list[int]] | None:
         """Choose this request's cpus: which nodes, and which cores on them.
 
@@ -401,12 +658,11 @@ class ResourcePool:
         is satisfied, using at most ``max_nodes`` of them. At ``max_nodes==1``
         this is the ordinary "one node holds the whole job" case; a larger
         ceiling is what lets an exclusive job take the machine. One mechanism
-        either way, so the ``only`` pin and the memory-aware node ranking
-        apply uniformly.
+        either way, so the ``only`` pin and the node ranking apply uniformly.
         """
         cpus: list[int] = []
         nodes: list[int] = []
-        for node in self._cpu_node_order(req, only, max_nodes):
+        for node in self._cpu_node_order(req, only, max_nodes, near):
             if len(cpus) >= req.cpu or len(nodes) >= max_nodes:
                 break
             take = sorted(self.free_cpus[node])[: req.cpu - len(cpus)]
@@ -414,6 +670,99 @@ class ResourcePool:
                 cpus.extend(take)
                 nodes.append(node)
         return (cpus, nodes) if len(cpus) == req.cpu else None
+
+    def _gpu_pools(self, req: Request) -> list[list[int]]:
+        """The free GPUs this request may draw from, as the sets one of which
+        has to hold all of them: the whole machine, or a node's worth each
+        when the job asked to stay on one node.
+        """
+        free = sorted(self.free_gpus)
+        if not req.numa_local_gpu:
+            return [free]
+        by_node = self.gpus_by_node(free)
+        return [by_node[node] for node in sorted(by_node)]
+
+    def _pick_gpus(self, req: Request, *, search: bool = True) -> list[int] | None:
+        """The GPUs to give this request, or None when the free ones cannot
+        satisfy it and the job has to wait.
+
+        ``search`` off takes them in index order rather than looking for the
+        closest set, for a caller only asking whether the request fits: which
+        GPUs a job gets does not normally decide that. A ``min_gpu_link`` floor
+        is the exception, because then the closest set is the only one that can
+        clear it, so a floor searches whatever the caller asked for.
+        """
+        count = req.gpu_cores
+        pools = [pool for pool in self._gpu_pools(req) if len(pool) >= count]
+        if not pools:
+            return None
+        searching = search or bool(req.min_gpu_link)
+        if count <= 0 or not self.gpu_topology or not searching:
+            return pools[0][:count]
+        quality, gpus = min(
+            (self.gpu_topology.quality(pick), pick)
+            for pick in (self._closest_gpus(pool, count) for pool in pools)
+        )
+        if req.min_gpu_link and quality.worst > _link_rank(req.min_gpu_link):
+            return None
+        return gpus
+
+    def _closest_gpus(self, free: list[int], count: int) -> list[int]:
+        """The closest-connected ``count`` of ``free``.
+
+        Found by climbing the machine's own structure rather than by scoring
+        every combination: at each level of the interconnect, only the islands
+        wide enough to hold the job are looked inside, and the first level that
+        really delivers a set that good is the best the job can get — anything
+        better would have been a whole island one level down, where there was
+        no island big enough.
+        """
+        if count >= len(free):
+            return free[:count]
+        topo = self.gpu_topology
+        for level in range(len(_LINK_CLASSES) + 1):
+            roomy = [i for i in topo.islands(free, level) if len(i) >= count]
+            if not roomy:
+                continue
+            picks = [self._within_island(island, count, level) for island in roomy]
+            # Between islands that would serve the job equally well, take from
+            # the one with least left to give, so whole islands stay whole for
+            # the jobs that need one. Same best-fit as cpu nodes get, and the
+            # ids only settle what that leaves tied.
+            quality, _, gpus = min(
+                (topo.quality(pick), len(island), pick)
+                for island, pick in zip(roomy, picks)
+            )
+            # Reaching this level joined an island's GPUs; it did not make them
+            # pairwise close, because NVLink is a mesh and not a hierarchy. So
+            # take the set only if it really is this good, and otherwise let the
+            # wider islands one level up be searched.
+            if quality.worst <= level:
+                return gpus
+        # Unreachable: the last level joins every pair, known or not, so one of
+        # them always matched. Here to keep the function total.
+        return free[:count]
+
+    def _within_island(self, island: list[int], count: int, level: int) -> list[int]:
+        """``count`` GPUs from one island, best set first."""
+        if count >= len(island):
+            return list(island)
+        if math.comb(len(island), count) * math.comb(count, 2) <= _MAX_GPU_LINK_SCANS:
+            # Islands are small, and this is the only exact answer where the
+            # links inside one are a mesh rather than a hierarchy.
+            return list(min(itertools.combinations(island, count), key=self.gpu_topology.quality))
+        # Too wide to enumerate, which means it is a coarse level holding
+        # several finer islands (a finer one alone would have been chosen
+        # instead). Every pair that crosses between them costs this level, and
+        # taking whole islands, biggest first, is what leaves fewest such
+        # pairs.
+        chosen: list[int] = []
+        finer = sorted(self.gpu_topology.islands(island, level - 1), key=lambda i: (-len(i), i))
+        for sub in finer:
+            if len(chosen) >= count:
+                break
+            chosen += self._within_island(sub, min(len(sub), count - len(chosen)), level - 1)
+        return sorted(chosen)
 
     def _charge_plan(self, req: Request, home: int) -> dict[int, float] | None:
         """How much of the budget to charge to each memory domain, home node
@@ -428,7 +777,7 @@ class ResourcePool:
             return {}
         home_key = self.mem_key(home)
         order = [home_key]
-        if not req.numa_local:
+        if not req.numa_local_mem:
             order += [k for k in sorted(self.free_mem_gb) if k != home_key]
         charge: dict[int, float] = {}
         remaining = req.mem_gb
@@ -441,15 +790,36 @@ class ResourcePool:
                 remaining -= take
         return None if remaining > _EPS else charge
 
-    def _plan(self, req: Request, node: int | None = None) -> Allocation | None:
-        """Build the allocation this request would get, without taking it."""
+    def _plan(
+        self, req: Request, node: int | None = None, *, place_gpus: bool = True
+    ) -> Allocation | None:
+        """Build the allocation this request would get, without taking it.
+
+        Without ``place_gpus`` the gpus are taken in index order instead of
+        searched for: *which* gpus a job gets never decides whether it fits,
+        so a caller only asking that question need not pay for the search.
+        """
         if self.exclusive_active:
             return None
         if req.exclusive and self.active > 0:
             return None
         if req.gpu_cores > len(self.free_gpus):
             return None
-        picked = self._pick_cpus(req, node, self._max_nodes(req))
+        # GPUs first: they are the fixed points here — a job cannot be moved
+        # to the other end of the machine, but its cpus can be placed near it.
+        gpus = self._pick_gpus(req, search=place_gpus)
+        if gpus is None:
+            return None
+        near = self.gpu_topology.nodes_for(gpus)
+        if req.numa_local_gpu and near:
+            # Kept whole: the node owning its gpus has to own its cpus too, so
+            # what feeds them never crosses the interconnect. _gpu_pools has
+            # already made that one node.
+            home = min(near)
+            if node is not None and node != home:
+                return None
+            node = home
+        picked = self._pick_cpus(req, node, self._max_nodes(req), near)
         if picked is None:
             return None
         cpus, cpu_nodes = picked
@@ -459,7 +829,7 @@ class ResourcePool:
         return Allocation(
             cpus=cpus,
             numa_nodes=cpu_nodes,
-            gpus=sorted(self.free_gpus)[: req.gpu_cores],
+            gpus=gpus,
             mem_gb=req.mem_gb,
             mem_by_node=charge,
             exclusive=req.exclusive,
@@ -467,7 +837,7 @@ class ResourcePool:
 
     def would_fit(self, req: Request) -> bool:
         """True if this request could be allocated right now (non-mutating)."""
-        return self._plan(req) is not None
+        return self._plan(req, place_gpus=False) is not None
 
     def allocate(self, req: Request, node: int | None = None) -> Allocation | None:
         """Try to allocate; None means the job must keep waiting. ``node``
