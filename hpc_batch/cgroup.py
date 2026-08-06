@@ -1,10 +1,9 @@
 """cgroup v2 management for job isolation.
 
 Jobs go in `/sys/fs/cgroup/hpc-batch/job-<id>`, with cpuset (cpus pinned to
-one NUMA node) and memory limits applied. That tree is deliberately outside
-the daemon's service cgroup: jobs KillMode=process leaves behind would keep
-that cgroup populated, and systemd could not recreate it on restart
-(219/CGROUP) for as long as any of them lived.
+one NUMA node) and memory limits applied. That tree sits outside the daemon's
+service cgroup: KillMode=process leaves jobs behind on stop, and systemd
+cannot recreate a service cgroup that still has processes in it (219/CGROUP).
 
 Everything degrades gracefully: when cgroups are unavailable (not root,
 no cgroup v2, missing controllers) the daemon falls back to
@@ -31,9 +30,8 @@ class CgroupManager:
         self.controllers: set[str] = set()
 
     def setup(self) -> bool:
-        """Create or reclaim the job subtree, leaving the cgroups of jobs that
-        outlived the previous daemon alone. Returns True when cgroups are
-        usable."""
+        """Claim the job subtree, creating it if a previous daemon has not.
+        Returns True when cgroups are usable."""
         if not self.enabled:
             log.info("cgroups disabled by configuration")
             return False
@@ -56,7 +54,6 @@ class CgroupManager:
             log.warning("cgroup setup failed (%s); jobs will not be isolated", exc)
             return False
         self.ready = True
-        self._prune()
         log.info(
             "cgroup subtree %s ready (controllers: %s)",
             self.root, ", ".join(sorted(self.controllers)) or "none",
@@ -69,20 +66,16 @@ class CgroupManager:
             )
         return True
 
-    def _prune(self) -> None:
-        """Remove job cgroups left behind by a previous daemon; nothing else
-        reaps them outside the service cgroup, and the list of cgroups still
-        busy at removal is in-memory only. A populated one is a job about to
-        be adopted, and rmdir refuses it in any case, so a lost state file
-        cannot turn every running job into an orphan."""
+    def prune(self) -> None:
+        """Remove job cgroups left behind by a previous daemon. rmdir refuses
+        one that still holds processes, so a job about to be re-adopted keeps
+        its own, and try_remove is the wrong tool here because it kills first.
+        Call it only once the daemon has finalized the jobs that died while it
+        was away: that reads memory.events out of their cgroups."""
+        if not self.ready:
+            return
         removed = 0
         for path in self.root.glob("job-*"):
-            try:
-                pids = (path / "cgroup.procs").read_text().strip()
-            except OSError:
-                pids = ""  # let rmdir be the judge
-            if pids:
-                continue
             try:
                 path.rmdir()
             except OSError:

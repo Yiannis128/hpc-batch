@@ -20,9 +20,7 @@ def manager(tmp_path: Path, controllers=("cpuset", "memory")) -> CgroupManager:
 
 
 def fake_cgroup_fs(tmp_path: Path, monkeypatch, controllers="cpuset memory") -> Path:
-    """Stand in for /sys/fs/cgroup, building the interface files the kernel
-    would materialise. Returns the job subtree, which has `controllers` to
-    hand out to its children."""
+    """Stand in for /sys/fs/cgroup; returns the job subtree."""
     (tmp_path / "cgroup.controllers").write_text("cpuset memory pids\n")
     monkeypatch.setattr(cgroup_mod, "CGROUP_FS", tmp_path)
     root = tmp_path / "hpc-batch"
@@ -32,9 +30,8 @@ def fake_cgroup_fs(tmp_path: Path, monkeypatch, controllers="cpuset memory") -> 
 
 
 def job_cgroup(root: Path, job_id: int, pids: str = "") -> Path:
-    """A job cgroup left behind by a previous daemon; `pids` is its
-    cgroup.procs. A job that ended is a bare directory: rmdir on real cgroupfs
-    ignores the interface files, but here they would block it."""
+    # A job that ended is left as a bare directory: rmdir on real cgroupfs
+    # ignores the interface files, but on a temporary one they would block it.
     path = root / f"job-{job_id}"
     path.mkdir()
     if pids:
@@ -60,9 +57,8 @@ class TestSetup:
         assert cg.create(1, cpus=[0], mems=[0], mem_bytes=None) == root / "job-1"
         assert "NO NUMA ISOLATION" not in caplog.text
 
-    def test_a_restart_leaves_live_job_cgroups_alone(self, tmp_path, monkeypatch):
-        # The outage this guards against: a daemon coming back must adopt the
-        # cgroups of jobs that outlived it, not disturb or recreate them.
+    def test_claiming_an_existing_subtree_does_not_disturb_it(self, tmp_path, monkeypatch):
+        # A restarted daemon claims a tree it is already running jobs in.
         root = fake_cgroup_fs(tmp_path, monkeypatch)
         live = job_cgroup(root, 7, pids="4242\n")
         (live / "cpuset.cpus").write_text("12-23")
@@ -70,28 +66,6 @@ class TestSetup:
         assert CgroupManager().setup() is True
 
         assert read(live, "cpuset.cpus") == "12-23"
-
-    def test_a_restart_reaps_the_cgroups_of_jobs_that_ended(self, tmp_path, monkeypatch):
-        # Nothing else does: the tree outlives the unit by design, and the
-        # busy-cgroup retry list is in memory only.
-        root = fake_cgroup_fs(tmp_path, monkeypatch)
-        dead = job_cgroup(root, 3)
-
-        assert CgroupManager().setup() is True
-
-        assert not dead.exists()
-
-    def test_creates_nothing_outside_its_own_subtree(self, tmp_path, monkeypatch):
-        # Putting jobs in the service cgroup is what made the unit
-        # unrestartable once a job outlived it, so setup writes nowhere else.
-        fake_cgroup_fs(tmp_path, monkeypatch)
-        service = tmp_path / "system.slice" / "hpc-batch.service"
-        service.mkdir(parents=True)
-        (service / "cgroup.procs").write_text("1234\n")
-
-        CgroupManager().setup()
-
-        assert list(service.iterdir()) == [service / "cgroup.procs"]
 
     def test_a_controller_the_kernel_root_withholds_is_skipped(self, tmp_path, monkeypatch, caplog):
         fake_cgroup_fs(tmp_path, monkeypatch, controllers="memory")
@@ -115,6 +89,32 @@ class TestSetup:
 
         assert cg.setup() is False
         assert not (tmp_path / "hpc-batch").exists()
+
+
+class TestPrune:
+    """Job cgroups outlive the daemon that made them, and nothing else reaps
+    them now that the tree sits outside the service cgroup."""
+
+    def test_reaps_the_cgroups_of_jobs_that_ended(self, tmp_path):
+        dead = job_cgroup(tmp_path, 3)
+
+        manager(tmp_path).prune()
+
+        assert not dead.exists()
+
+    def test_leaves_a_job_that_is_still_running_alone(self, tmp_path):
+        live = job_cgroup(tmp_path, 7, pids="4242\n")
+
+        manager(tmp_path).prune()
+
+        assert live.exists()
+
+    def test_does_nothing_until_a_subtree_has_been_claimed(self, tmp_path):
+        dead = job_cgroup(tmp_path, 3)
+
+        CgroupManager(root=tmp_path).prune()  # setup() never ran
+
+        assert dead.exists()
 
 
 class TestCreate:

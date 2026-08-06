@@ -221,6 +221,9 @@ class Daemon:
         self._setup_pool()
         self._resolve_admin_gid()
         self._load_state()
+        # Only now: _load_state finalizes the jobs that died while we were
+        # away, and finalizing reads memory.events out of their cgroups.
+        self.cgroups.prune()
         # Apply the retention limit to what we just loaded, so lowering
         # --keep-finished takes effect on the next start rather than only
         # once another job happens to finish.
