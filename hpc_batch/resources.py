@@ -30,6 +30,15 @@ of the machine whenever the index between them is busy. So the pool hands
 out the closest-connected free set that `nvidia-smi topo -m` describes, and
 puts the job's cpus on the NUMA node those GPUs hang off. Where that file
 tells us nothing, GPU choice is index order, as it was before.
+
+Closest is found by walking the machine's own structure rather than by
+scoring every combination of GPUs. Each level of the interconnect cuts the
+free GPUs into islands — the GPUs behind one switch, one host bridge, one
+socket — and a job is placed in the finest island that can hold it, because
+a better set would have to be a whole island one level down, where there was
+none big enough. Which island, when several would do, is a best-fit decision
+exactly like the one CPU nodes get: take from the island with least left to
+give, so that whole islands stay whole for the jobs that need one.
 """
 
 import copy
@@ -55,11 +64,12 @@ _MEMTOTAL_LINE = re.compile(r"^Node \d+ MemTotal:\s+(\d+) kB")
 #: Link classes from the legend of `nvidia-smi topo -m`, closest first.
 _LINK_CLASSES = ("NV", "PIX", "PXB", "PHB", "NODE", "SYS")
 
-#: Links an exhaustive search over candidate GPU sets may score before we
-#: fall back to a greedy one. Every machine of up to 10 GPUs stays exhaustive
-#: whatever it is asked for; the bound is there because the search grows
-#: combinatorially and this runs on every scheduling tick.
-_MAX_GPU_LINK_SCANS = 5_000
+#: Links we will score to choose between the GPU sets one island offers. Past
+#: this the island is taken apart into the finer ones inside it instead, which
+#: is both cheaper and what the answer looks like anyway at that width. No
+#: island of a real machine comes close: it is reached only by a topology with
+#: no structure to take apart.
+_MAX_GPU_LINK_SCANS = 20_000
 
 #: Memory-domain key used when jobs are not confined to one node's memory.
 SHARED_MEM = -1
@@ -236,29 +246,46 @@ class GpuTopology:
     def _pairs(self, gpus: Iterable[int]) -> list[str | None]:
         return [self.link(a, b) for a, b in itertools.combinations(sorted(gpus), 2)]
 
-    def _score(self, links: list[str | None]) -> tuple[int, int, int]:
-        """Worst link, total distance, then NVLink width (more is better)."""
-        ranks = [_link_rank(link) for link in links]
-        return (
-            max(ranks, default=0),
-            sum(ranks),
-            -sum(_nvlink_width(link) for link in links),
-        )
-
-    def rank(self, gpus: Iterable[int]) -> tuple:
-        """Sort key over candidate GPU sets, closest set first.
+    def quality(self, gpus: Iterable[int]) -> tuple[int, int, int]:
+        """How good a set of GPUs is as a group, best first.
 
         The worst link leads because a collective runs at the speed of its
         slowest pair: four NVLinked GPUs and one across the machine is a
-        five-GPU job bound by that one hop. The ids come last so that two
-        equally good sets always resolve the same way.
+        five-GPU job bound by that one hop. Total distance settles sets with
+        the same pacing link, and NVLink width (more is better) settles those.
         """
-        ids = sorted(gpus)
-        return (*self._score(self._pairs(ids)), ids)
+        pairs = self._pairs(gpus)
+        ranks = [_link_rank(link) for link in pairs]
+        return (
+            max(ranks, default=0),
+            sum(ranks),
+            -sum(_nvlink_width(link) for link in pairs),
+        )
 
-    def attach_rank(self, chosen: Iterable[int], gpu: int) -> tuple:
-        """Sort key over GPUs to add to ``chosen``: only the new links."""
-        return (*self._score([self.link(gpu, c) for c in chosen]), gpu)
+    def islands(self, gpus: Iterable[int], level: int) -> list[list[int]]:
+        """``gpus`` split into groups joined by links no worse than ``level``.
+
+        For the PCIe classes this is the machine's own structure: a GPU sits
+        under a switch, under a host bridge, under a socket, so "no worse than
+        L" is transitive and the groups are exactly those units. NVLink is a
+        mesh and not a hierarchy — on a DGX-1 all eight GPUs are one NVLinked
+        group but only its quads are wired pairwise — so a group is somewhere
+        the answer may be, never proof that the answer is the whole group.
+        """
+        rest = sorted(gpus)
+        groups: list[list[int]] = []
+        while rest:
+            group = [rest.pop(0)]
+            frontier = list(group)
+            while frontier:
+                gpu = frontier.pop()
+                joined = [g for g in rest if _link_rank(self.link(gpu, g)) <= level]
+                for g in joined:
+                    rest.remove(g)
+                group += joined
+                frontier += joined
+            groups.append(sorted(group))
+        return groups
 
     def worst_link(self, gpus: Iterable[int]) -> str | None:
         """The link class pacing this set. None when it has no pair, or none
@@ -579,26 +606,60 @@ class ResourcePool:
         """``count`` free GPUs: the closest-connected set, or the lowest free
         indices when there is no topology to consult, when the free GPUs are
         exactly used up either way, or when ``search`` is off.
+
+        The set is found by climbing the machine's own structure rather than
+        by scoring every combination: at each level of the interconnect, only
+        the islands wide enough to hold the job are looked inside, and the
+        first level that really delivers a set that good is the best the job
+        can get — anything better would have been a whole island one level
+        down, where there was no island big enough.
         """
         free = sorted(self.free_gpus)
         if not search or count <= 0 or count >= len(free) or not self.gpu_topology:
             return free[:count]
-        if math.comb(len(free), count) * math.comb(count, 2) <= _MAX_GPU_LINK_SCANS:
-            return list(min(itertools.combinations(free, count), key=self.gpu_topology.rank))
-        # Too many sets to score them all: grow one from each starting GPU,
-        # each step taking whichever GPU is closest to what is already held,
-        # and keep the best of those. On the layouts real machines have (tight
-        # islands, everything else far) this finds the same set anyway.
-        grown = [self._grow_gpu_set(free, seed, count) for seed in free]
-        return min(grown, key=self.gpu_topology.rank)
+        topo = self.gpu_topology
+        chosen = free[:count]
+        for level in range(len(_LINK_CLASSES) + 1):
+            best: tuple | None = None
+            for island in topo.islands(free, level):
+                if len(island) < count:
+                    continue
+                candidate = self._within_island(island, count, level)
+                # Between islands that would serve the job equally well, take
+                # from the one with least left to give, so whole islands stay
+                # whole for the jobs that need one. Same best-fit as cpu nodes
+                # get, and the ids only settle what that leaves tied.
+                key = (topo.quality(candidate), len(island), candidate)
+                if best is None or key < best:
+                    best = key
+            # Reaching this level joined an island's GPUs; it did not make
+            # them pairwise close, because NVLink is a mesh and not a
+            # hierarchy. So take the set only if it really is this good, and
+            # otherwise let the wider islands one level up be searched.
+            if best is not None and best[0][0] <= level:
+                chosen = best[2]
+                break
+        return chosen
 
-    def _grow_gpu_set(self, free: list[int], seed: int, count: int) -> list[int]:
-        chosen = [seed]
-        rest = [g for g in free if g != seed]
-        while len(chosen) < count:
-            nxt = min(rest, key=lambda g: self.gpu_topology.attach_rank(chosen, g))
-            chosen.append(nxt)
-            rest.remove(nxt)
+    def _within_island(self, island: list[int], count: int, level: int) -> list[int]:
+        """``count`` GPUs from one island, best set first."""
+        if count >= len(island):
+            return list(island)
+        if math.comb(len(island), count) * math.comb(count, 2) <= _MAX_GPU_LINK_SCANS:
+            # Islands are small, and this is the only exact answer where the
+            # links inside one are a mesh rather than a hierarchy.
+            return list(min(itertools.combinations(island, count), key=self.gpu_topology.quality))
+        # Too wide to enumerate, which means it is a coarse level holding
+        # several finer islands (a finer one alone would have been chosen
+        # instead). Every pair that crosses between them costs this level, and
+        # taking whole islands, biggest first, is what leaves fewest such
+        # pairs.
+        chosen: list[int] = []
+        finer = sorted(self.gpu_topology.islands(island, level - 1), key=lambda i: (-len(i), i))
+        for sub in finer:
+            if len(chosen) >= count:
+                break
+            chosen += self._within_island(sub, min(len(sub), count - len(chosen)), level - 1)
         return sorted(chosen)
 
     def _charge_plan(self, req: Request, home: int) -> dict[int, float] | None:

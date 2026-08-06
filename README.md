@@ -54,6 +54,13 @@ and benchmark timings are stable.
   and the line logged at start-up names the link class it ended up with.
   Where `nvidia-smi topo -m` is unavailable the daemon says so at startup and
   falls back to index order.
+- **GPUs are spent worst-first.** Each level of the interconnect divides the
+  free GPUs into islands — what sits behind one switch, one host bridge, one
+  socket — and a job goes in the finest island that can hold it. When several
+  would serve it equally well it takes from the one with least left to give,
+  so a 2-GPU job carves into a quad that is already broken instead of
+  splitting an intact one and leaving nothing for the job behind it that
+  needs four. Same best-fit reasoning the CPU nodes get.
 - **/dev/hpc-batch/jobs/**: every queued/running job appears as
   `/dev/hpc-batch/jobs/<id>` (a symlink to its state directory) containing
   `info.json` (metadata) and `output` (combined stdout/stderr). Entries are

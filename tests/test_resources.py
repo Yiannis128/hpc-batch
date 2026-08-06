@@ -46,6 +46,27 @@ def topo_pool() -> ResourcePool:
     return pool
 
 
+def two_quads() -> GpuTopology:
+    """Eight GPUs as two NVLinked quads, one per NUMA node, a SYS hop apart."""
+    return GpuTopology(
+        links={
+            (a, b): ("NV2" if a // 4 == b // 4 else "SYS")
+            for a in range(8) for b in range(a + 1, 8)
+        },
+        numa_node={gpu: gpu // 4 for gpu in range(8)},
+    )
+
+
+def quad_pool() -> ResourcePool:
+    """A `two_quads` machine, 8 cpus and 64 GiB behind each quad."""
+    return ResourcePool(
+        node_cpus={0: list(range(8)), 1: list(range(8, 16))},
+        gpu_ids=list(range(8)),
+        node_mem_gb={0: 64.0, 1: 64.0},
+        gpu_topology=two_quads(),
+    )
+
+
 def req(cpu=1, gpu=0, mem=None, exclusive=False, numa_local=False) -> Request:
     return Request(cpu=cpu, gpu_cores=gpu, mem_gb=mem,
                    exclusive=exclusive, numa_local=numa_local)
@@ -391,21 +412,35 @@ class TestGpuTopologyRanking:
             (0, 1): "NV1", (0, 2): "NV1", (1, 2): "SYS",
             (0, 3): "PIX", (1, 3): "PIX", (2, 3): "PIX",
         })
-        assert topo.rank([0, 1, 3]) < topo.rank([0, 1, 2])
+        assert topo.quality([0, 1, 3]) < topo.quality([0, 1, 2])
 
     def test_wider_nvlink_breaks_a_tie(self):
         topo = GpuTopology(links={(0, 1): "NV1", (0, 2): "NV4", (1, 2): "NV1"})
-        assert topo.rank([0, 2]) < topo.rank([0, 1])
+        assert topo.quality([0, 2]) < topo.quality([0, 1])
 
     def test_unknown_links_sort_behind_every_known_one(self):
         topo = GpuTopology(links={(0, 1): "SYS", (0, 2): "NVLINK-C2C"})
-        assert topo.rank([0, 1]) < topo.rank([0, 2])
+        assert topo.quality([0, 1]) < topo.quality([0, 2])
 
     def test_worst_link_names_the_pacing_hop(self):
         topo = parse_gpu_topology(TOPO_OUTPUT)
         assert topo.worst_link([0, 1]) == "NV2"
         assert topo.worst_link([0, 1, 2]) == "SYS"
         assert topo.worst_link([1]) is None
+
+
+class TestGpuIslands:
+    def test_each_level_recovers_the_machine_that_built_it(self):
+        topo = two_quads()
+        every = list(range(8))
+        assert topo.islands(every, 0) == [[0, 1, 2, 3], [4, 5, 6, 7]]  # NVLink
+        assert topo.islands(every, 5) == [every]  # SYS joins the machine
+
+    def test_only_the_free_gpus_are_grouped(self):
+        assert two_quads().islands([1, 2, 5], 0) == [[1, 2], [5]]
+
+    def test_a_level_below_the_finest_link_leaves_singletons(self):
+        assert two_quads().islands([0, 1], -1) == [[0], [1]]
 
 
 class TestGpuPlacement:
@@ -435,14 +470,39 @@ class TestGpuPlacement:
         alloc = pool.allocate(req(cpu=4, gpu=4))
         assert alloc is not None and alloc.gpus == [0, 1, 2, 3]
 
-    def test_greedy_fallback_picks_the_same_pair(self, monkeypatch):
-        # The path taken when there are too many candidate sets to score
-        # exhaustively; forced here, since no real machine has that many gpus.
+    def test_takes_the_broken_island_and_leaves_the_whole_one(self):
+        # Both quads would serve a 2-gpu job equally well, so index order
+        # would carve up the untouched one and leave nothing for a job that
+        # needs four. Best fit spends the quad that is already spent.
+        pool = quad_pool()
+        pool.reserve(held([8], node=1, gpus=[4]))
+        alloc = pool.allocate(req(cpu=2, gpu=2))
+        assert alloc is not None and alloc.gpus == [5, 6]
+        # ...so the 4-gpu job behind it still gets a whole NVLinked quad.
+        after = pool.allocate(req(cpu=2, gpu=4))
+        assert after is not None and after.gpus == [0, 1, 2, 3]
+
+    def test_the_finest_level_with_room_decides_the_pacing_link(self):
+        pool = quad_pool()
+        pool.reserve(held([0], node=0, gpus=[0, 1]))
+        # Six gpus free but no NVLinked island holds five, so this job pays
+        # for SYS wherever it goes. Taking a whole quad and one straggler
+        # leaves four crossing pairs; splitting it 3+2 would leave six.
+        alloc = pool.allocate(req(cpu=2, gpu=5))
+        assert alloc is not None and alloc.gpus == [2, 4, 5, 6, 7]
+        assert pool.gpu_topology.worst_link(alloc.gpus) == "SYS"
+
+    def test_islands_are_taken_apart_when_too_wide_to_score(self, monkeypatch):
+        # Forces the path for an island holding more sets than we will score:
+        # it is spread over the finer islands inside, biggest first.
         monkeypatch.setattr(resources, "_MAX_GPU_LINK_SCANS", 0)
-        pool = topo_pool()
-        pool.reserve(held([0], node=0, gpus=[1]))
-        alloc = pool.allocate(req(gpu=2))
-        assert alloc is not None and alloc.gpus == [2, 3]
+        pool = quad_pool()
+        pool.reserve(held([8], node=1, gpus=[4]))
+        assert pool.allocate(req(cpu=2, gpu=2)).gpus == [5, 6]
+        # Same answer the scored path gives, for the same reason.
+        pool = quad_pool()
+        pool.reserve(held([0], node=0, gpus=[0, 1]))
+        assert pool.allocate(req(cpu=2, gpu=5)).gpus == [2, 4, 5, 6, 7]
 
     def test_cpus_land_on_the_node_the_gpus_hang_off(self):
         pool = topo_pool()
