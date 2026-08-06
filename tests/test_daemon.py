@@ -456,16 +456,16 @@ class TestSubmit:
 
     def test_numa_local_rejects_a_budget_no_node_can_hold(self, tmp_path):
         daemon = pooled_daemon(tmp_path)
-        resp = self.submit(daemon, cpu=1, max_mem_gb=48.0, numa_local=True)
+        resp = self.submit(daemon, cpu=1, max_mem_gb=48.0, numa_local_mem=True)
         assert not resp["ok"]
         assert "--numa-local" in resp["error"] and "--exclusive" in resp["error"]
 
     def test_numa_local_queues_when_merely_unavailable(self, tmp_path):
         daemon = pooled_daemon(tmp_path)
         # Fits a node in principle, so it must queue rather than be refused.
-        resp = self.submit(daemon, cpu=1, max_mem_gb=32.0, numa_local=True)
+        resp = self.submit(daemon, cpu=1, max_mem_gb=32.0, numa_local_mem=True)
         assert resp["ok"]
-        assert daemon.jobs[resp["id"]].numa_local is True
+        assert daemon.jobs[resp["id"]].numa_local_mem is True
 
 
 class TestList:

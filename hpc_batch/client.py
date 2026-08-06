@@ -72,7 +72,8 @@ def cmd_new(args: argparse.Namespace, command: list[str]) -> int:
         "max_mem_gb": args.max_mem,
         "max_time_s": args.max_time,
         "exclusive": args.exclusive,
-        "numa_local": args.numa_local,
+        "numa_local_mem": args.numa_local or args.numa_local_mem,
+        "numa_local_gpu": args.numa_local or args.numa_local_gpu,
         "env": dict(os.environ) if args.env else {},
         "output": output,
     }
@@ -141,7 +142,7 @@ def cmd_list(args: argparse.Namespace) -> int:
     print(format_table(headers, rows))
     if any(job.get("mem_spans_nodes") for job in jobs):
         print("\n+ memory spans NUMA nodes; the remote part is slower to access. "
-              "Use --numa-local to wait for a node that fits instead.")
+              "Use --numa-local-mem to wait for a node that fits instead.")
     for job in jobs:
         if job.get("reason") == OOM:
             how = "assigned by default" if job.get("mem_defaulted") else "requested"
@@ -227,9 +228,17 @@ def build_parser() -> argparse.ArgumentParser:
                             "a NUMA node your cores represent; the job is "
                             "killed if it exceeds the limit either way")
     p_new.add_argument("--numa-local", action="store_true",
+                       help="keep the whole job on one NUMA node: implies both "
+                            "--numa-local-mem and --numa-local-gpu")
+    p_new.add_argument("--numa-local-mem", action="store_true",
                        help="only run where the whole memory budget fits on "
                             "the same NUMA node as the cpus, waiting if "
                             "necessary, instead of spreading it across nodes")
+    p_new.add_argument("--numa-local-gpu", action="store_true",
+                       help="only run where every gpu hangs off one NUMA node "
+                            "and the cpus come from that node, waiting if "
+                            "necessary, instead of reaching across the "
+                            "interconnect")
     p_new.add_argument("--max-time", type=duration_arg, default=None, metavar="DURATION",
                        help="kill the job after this long, e.g. 30m or 2h "
                             "(default and upper bound: the admin's max lifetime)")

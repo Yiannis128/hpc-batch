@@ -509,7 +509,8 @@ class Daemon:
             time_raw = req.get("max_time_s")
             requested = int(time_raw) if time_raw is not None else None
             exclusive = bool(req.get("exclusive"))
-            numa_local = bool(req.get("numa_local"))
+            numa_local_mem = bool(req.get("numa_local_mem"))
+            numa_local_gpu = bool(req.get("numa_local_gpu"))
             # An exclusive job owns the machine, so "unspecified" means all
             # of it rather than a single core.
             default_cpu = self.pool.total_cpus() if exclusive else 1
@@ -529,7 +530,7 @@ class Daemon:
             mem_gb = self._default_mem_gb(cpu, exclusive)
 
         problem = self.pool.validate(
-            Request(cpu, gpu_cores, mem_gb, exclusive, numa_local)
+            Request(cpu, gpu_cores, mem_gb, exclusive, numa_local_mem, numa_local_gpu)
         )
         if problem:
             return err(problem)
@@ -565,7 +566,8 @@ class Daemon:
             max_mem_gb=mem_gb,
             max_time_s=max_time,
             exclusive=exclusive,
-            numa_local=numa_local,
+            numa_local_mem=numa_local_mem,
+            numa_local_gpu=numa_local_gpu,
             env=env,
             mem_defaulted=mem_defaulted,
             submit_time=time.time(),
@@ -582,7 +584,11 @@ class Daemon:
             " default" if mem_defaulted else "",
             format_duration(max_time),
             " exclusive" if exclusive else "",
-            " numa-local" if numa_local else "",
+            "".join(
+                f" numa-local-{what}"
+                for what, on in (("mem", numa_local_mem), ("gpu", numa_local_gpu))
+                if on
+            ),
         )
         self._schedule()
         self._persist()

@@ -67,9 +67,10 @@ def quad_pool() -> ResourcePool:
     )
 
 
-def req(cpu=1, gpu=0, mem=None, exclusive=False, numa_local=False) -> Request:
-    return Request(cpu=cpu, gpu_cores=gpu, mem_gb=mem,
-                   exclusive=exclusive, numa_local=numa_local)
+def req(cpu=1, gpu=0, mem=None, exclusive=False,
+        numa_local_mem=False, numa_local_gpu=False) -> Request:
+    return Request(cpu=cpu, gpu_cores=gpu, mem_gb=mem, exclusive=exclusive,
+                   numa_local_mem=numa_local_mem, numa_local_gpu=numa_local_gpu)
 
 
 def held(cpus, node=0, gpus=(), mem=None) -> Allocation:
@@ -254,14 +255,14 @@ class TestSpanningNodes:
 
     def test_numa_local_waits_instead_of_spanning(self):
         pool = make_pool()
-        assert pool.allocate(req(mem=48.0, numa_local=True)) is None
+        assert pool.allocate(req(mem=48.0, numa_local_mem=True)) is None
         # ...and the same budget without the flag runs immediately.
         assert pool.allocate(req(mem=48.0)) is not None
 
     def test_numa_local_picks_a_node_that_fits(self):
         pool = make_pool()
         pool.reserve(held([0], node=0, mem=20.0))
-        alloc = pool.allocate(req(cpu=2, mem=30.0, numa_local=True))
+        alloc = pool.allocate(req(cpu=2, mem=30.0, numa_local_mem=True))
         assert alloc is not None
         assert alloc.numa_node == 1 and not alloc.spans_nodes
 
@@ -302,7 +303,7 @@ class TestExclusiveSpansTheMachine:
 
     def test_numa_local_keeps_an_exclusive_job_on_one_node(self):
         pool = make_pool()
-        alloc = pool.allocate(req(cpu=4, mem=32.0, exclusive=True, numa_local=True))
+        alloc = pool.allocate(req(cpu=4, mem=32.0, exclusive=True, numa_local_mem=True))
         assert alloc is not None
         assert alloc.numa_nodes == [0]
         assert alloc.mem_by_node == {0: 32.0}
@@ -514,6 +515,43 @@ class TestGpuPlacement:
         assert alloc is not None and alloc.gpus == [2]
         assert alloc.numa_node == 1
 
+    def test_numa_local_gpu_waits_rather_than_span_nodes(self):
+        pool = quad_pool()
+        pool.reserve(held([0], node=0, gpus=[0, 1, 2]))
+        # One gpu left on node 0 and four on node 1, so a 2-gpu job can be
+        # served, but only by node 1.
+        alloc = pool.allocate(req(cpu=2, gpu=2, numa_local_gpu=True))
+        assert alloc is not None
+        assert alloc.gpus == [4, 5] and alloc.numa_node == 1
+
+    def test_numa_local_gpu_queues_when_no_node_has_enough(self):
+        pool = quad_pool()
+        pool.reserve(held([0], node=0, gpus=[0, 1, 2]))
+        pool.reserve(held([8], node=1, gpus=[4, 5, 6]))
+        # Two gpus free, one per node: enough for the job, but not on one node.
+        assert pool.allocate(req(cpu=2, gpu=2, numa_local_gpu=True)) is None
+        # ...and without the flag the same job runs, spanning the nodes.
+        alloc = pool.allocate(req(cpu=2, gpu=2))
+        assert alloc is not None and alloc.gpus == [3, 7]
+
+    def test_numa_local_gpu_puts_the_cpus_on_the_gpus_node(self):
+        pool = quad_pool()
+        # Node 0 has every core free, so cpu best-fit would prefer it; the
+        # job's gpus are on node 1, and the flag makes that binding.
+        pool.reserve(held([0], node=0, gpus=[0, 1, 2, 3]))
+        alloc = pool.allocate(req(cpu=2, gpu=2, numa_local_gpu=True))
+        assert alloc is not None and alloc.numa_node == 1
+        assert set(alloc.cpus) <= set(pool.node_cpus[1])
+
+    def test_numa_local_gpu_is_inert_without_gpus(self):
+        pool = quad_pool()
+        assert pool.allocate(req(cpu=2, numa_local_gpu=True)) is not None
+
+    def test_a_node_pin_that_fights_the_gpus_finds_nothing(self):
+        pool = quad_pool()
+        pool.reserve(held([0], node=0, gpus=[0, 1, 2, 3]))
+        assert pool.allocate(req(cpu=2, gpu=2, numa_local_gpu=True), node=0) is None
+
     def test_would_fit_agrees_with_allocate(self):
         # would_fit skips the search for the best set, on the grounds that
         # which gpus a job gets never decides whether it fits. If that ever
@@ -522,7 +560,8 @@ class TestGpuPlacement:
         pool.reserve(held([0], node=0, gpus=[1]))
         for request in [
             req(gpu=2), req(cpu=4, gpu=3), req(cpu=4, gpu=4),
-            req(cpu=2, gpu=1, mem=64.0), req(cpu=2, gpu=1, mem=48.0, numa_local=True),
+            req(cpu=2, gpu=1, mem=64.0), req(cpu=2, gpu=1, mem=48.0, numa_local_mem=True),
+            req(cpu=2, gpu=2, numa_local_gpu=True), req(cpu=2, gpu=3, numa_local_gpu=True),
         ]:
             assert pool.would_fit(request) == (pool.clone().allocate(request) is not None)
 
@@ -593,7 +632,7 @@ class TestValidate:
         assert pool.validate(req(cpu=8, exclusive=True)) is None
         assert pool.validate(req(cpu=9, exclusive=True)) is not None
         # ...but not once it is pinned to a single node.
-        assert pool.validate(req(cpu=8, exclusive=True, numa_local=True)) is not None
+        assert pool.validate(req(cpu=8, exclusive=True, numa_local_mem=True)) is not None
 
     def test_too_many_gpus(self):
         pool = make_pool()
@@ -610,12 +649,28 @@ class TestValidate:
 
     def test_numa_local_is_capped_at_one_node(self):
         pool = make_pool()
-        assert pool.validate(req(mem=32.0, numa_local=True)) is None
-        problem = pool.validate(req(mem=48.0, numa_local=True))
+        assert pool.validate(req(mem=32.0, numa_local_mem=True)) is None
+        problem = pool.validate(req(mem=48.0, numa_local_mem=True))
         # Unsatisfiable however long it waits, so it is refused at submit
         # time -- and the message has to name both ways out.
         assert problem is not None
         assert "--numa-local" in problem and "--exclusive" in problem
+
+    def test_numa_local_gpu_is_capped_at_one_node_of_gpus(self):
+        pool = quad_pool()
+        assert pool.validate(req(cpu=2, gpu=4, numa_local_gpu=True)) is None
+        # 8 gpus exist, but never 5 on one node: refused now rather than
+        # queued for a machine that can never satisfy it.
+        problem = pool.validate(req(cpu=2, gpu=5, numa_local_gpu=True))
+        assert problem is not None and "--numa-local-gpu" in problem
+        assert pool.validate(req(cpu=2, gpu=5)) is None
+
+    def test_numa_local_gpu_needs_a_topology_that_names_the_nodes(self):
+        pool = make_pool()  # gpus, but nothing says where they hang off
+        problem = pool.validate(req(gpu=1, numa_local_gpu=True))
+        assert problem is not None and "nvidia-smi topo -m" in problem
+        # It only bites a job that actually asked for gpus.
+        assert pool.validate(req(cpu=2, numa_local_gpu=True)) is None
 
     def test_asymmetric_nodes_are_judged_by_the_largest(self):
         pool = ResourcePool(
@@ -623,8 +678,8 @@ class TestValidate:
         )
         # 48 fits node 1 but not node 0: satisfiable, so it must queue rather
         # than be rejected.
-        assert pool.validate(req(mem=48.0, numa_local=True)) is None
-        assert pool.validate(req(mem=65.0, numa_local=True)) is not None
+        assert pool.validate(req(mem=48.0, numa_local_mem=True)) is None
+        assert pool.validate(req(mem=65.0, numa_local_mem=True)) is not None
 
     def test_memory_unchecked_when_untracked(self):
         assert untracked_pool().validate(req(mem=999.0)) is None

@@ -35,7 +35,7 @@ and benchmark timings are stable.
   no single node is spread across nodes instead of waiting; the extra nodes
   go into `cpuset.mems`, so the job can never allocate where nobody
   budgeted for it. Access to the remote part is slower, so `dispatch list`
-  marks those jobs with `+` and `--numa-local` refuses to spread at all,
+  marks those jobs with `+` and `--numa-local-mem` refuses to spread at all,
   waiting for a node that fits the whole budget. Under `--no-cgroups` a job
   really can allocate anywhere, and the daemon tracks one machine-wide pool
   instead; the startup log line says which mode is in force. Without that
@@ -61,6 +61,14 @@ and benchmark timings are stable.
   so a 2-GPU job carves into a quad that is already broken instead of
   splitting an intact one and leaving nothing for the job behind it that
   needs four. Same best-fit reasoning the CPU nodes get.
+- **`--numa-local-gpu` makes that a requirement.** By default a job takes
+  distant GPUs rather than queue. With the flag it waits instead: every GPU
+  it gets has to hang off one NUMA node, and its cpus come from that node, so
+  nothing it does crosses the interconnect. A request no single node could
+  ever hold is refused at submit time rather than queued forever, as is one
+  on a machine where `nvidia-smi topo -m` does not say which node a GPU
+  belongs to. `--numa-local` turns this on together with `--numa-local-mem`,
+  which is the way to ask for a job that is local in every respect.
 - **/dev/hpc-batch/jobs/**: every queued/running job appears as
   `/dev/hpc-batch/jobs/<id>` (a symlink to its state directory) containing
   `info.json` (metadata) and `output` (combined stdout/stderr). Entries are
@@ -252,7 +260,11 @@ dispatch new --exclusive -- ./timing_sensitive_bench
 
 # Insist on memory local to the job's own NUMA node, waiting for a node that
 # fits rather than spreading the budget across nodes:
-dispatch new --cpu 4 --max-mem 64 --numa-local -- ./latency_sensitive_bench
+dispatch new --cpu 4 --max-mem 64 --numa-local-mem -- ./latency_sensitive_bench
+
+# Keep the whole job on one node, memory and gpus alike, waiting for a node
+# that can hold all of it rather than reaching across the interconnect:
+dispatch new --cpu 8 --gpu-cores 2 --max-mem 64 --numa-local -- ./collective_bench
 
 # List my jobs / all jobs (all = admins, or everyone with --list-is-public):
 dispatch list

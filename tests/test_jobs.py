@@ -93,10 +93,10 @@ class TestJob:
         assert job.numa_nodes == [] and job.mem_by_node == {}
 
     def test_request_carries_the_placement_flags(self):
-        job = make_job(cpu=4, gpu_cores=2, numa_local=True, exclusive=True)
+        job = make_job(cpu=4, gpu_cores=2, numa_local_mem=True, exclusive=True)
         req = job.request()
         assert (req.cpu, req.gpu_cores, req.mem_gb) == (4, 2, 8.0)
-        assert req.exclusive and req.numa_local
+        assert req.exclusive and req.numa_local_mem
 
     def test_deadline_running_vs_queued(self):
         now = 1000.0

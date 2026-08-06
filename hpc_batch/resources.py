@@ -13,10 +13,16 @@ Placement therefore works like this:
 - It does not fit any single node: the charge is spread across nodes, home
   node first, and `cpuset.mems` lists exactly those nodes. Access to the
   spilled part is slower, so this is reported rather than done silently.
-- ``numa_local`` forbids the second case: the job waits for a node that can
-  hold the whole budget locally.
+- ``numa_local_mem`` forbids the second case: the job waits for a node that
+  can hold the whole budget locally.
 - ``exclusive`` owns the machine, so it takes cores from every node and may
   use all of the memory.
+
+``numa_local_gpu`` is the same bargain for GPUs: every GPU the job gets has
+to hang off one node, and its cpus come from that node, so nothing it does
+crosses the interconnect. A job that asks for it waits rather than take a
+placement that spans nodes. Both flags are what `dispatch new --numa-local`
+turns on together.
 
 Because every job is charged to exactly the nodes in its `cpuset.mems`, the
 books and the kernel can never disagree about where a job's memory lives.
@@ -377,7 +383,8 @@ class Request:
     gpu_cores: int = 0
     mem_gb: float | None = None
     exclusive: bool = False
-    numa_local: bool = False
+    numa_local_mem: bool = False
+    numa_local_gpu: bool = False
 
 
 @dataclass
@@ -476,6 +483,17 @@ class ResourcePool:
     def total_cpus(self) -> int:
         return sum(len(cpus) for cpus in self.node_cpus.values())
 
+    def gpus_by_node(self) -> dict[int, list[int]]:
+        """The machine's GPUs grouped by the NUMA node they hang off. Empty
+        when the topology does not say, which is what makes --numa-local-gpu
+        unenforceable rather than merely unavailable."""
+        by_node: dict[int, list[int]] = {}
+        for gpu in self.gpu_ids:
+            node = self.gpu_topology.numa_node.get(gpu)
+            if node is not None:
+                by_node.setdefault(node, []).append(gpu)
+        return by_node
+
     def proportional_share(self, cpu: int) -> float:
         """The memory ``cpu`` cores are worth, on the least generous node.
 
@@ -517,15 +535,29 @@ class ResourcePool:
                 )
         if req.gpu_cores > len(self.gpu_ids):
             return f"--gpu-cores {req.gpu_cores} exceeds the {len(self.gpu_ids)} gpus on this machine"
+        if req.numa_local_gpu and req.gpu_cores:
+            per_node = self.gpus_by_node()
+            if not per_node:
+                return (
+                    "--numa-local-gpu needs to know which NUMA node each gpu hangs "
+                    "off, and `nvidia-smi topo -m` does not say on this machine"
+                )
+            biggest = max(len(gpus) for gpus in per_node.values())
+            if req.gpu_cores > biggest:
+                return (
+                    f"--gpu-cores {req.gpu_cores} exceeds the {biggest} gpus on one "
+                    "NUMA node, and --numa-local-gpu keeps a job's gpus on one node; "
+                    "drop it to let them span nodes"
+                )
         if req.mem_gb is not None and self.tracks_memory:
-            if req.numa_local:
+            if req.numa_local_mem:
                 ceiling = self.largest_node_mem_gb()
                 if req.mem_gb > ceiling + _EPS:
                     return (
                         f"--max-mem {req.mem_gb:g} exceeds the largest NUMA node "
-                        f"({ceiling:.0f} GiB) and --numa-local keeps a job on one "
-                        "node; drop --numa-local to let the budget span nodes, or "
-                        "use --exclusive"
+                        f"({ceiling:.0f} GiB) and --numa-local-mem keeps a job on one "
+                        "node; drop it to let the budget span nodes, or use "
+                        "--exclusive"
                     )
             else:
                 ceiling = self.usable_mem_gb()
@@ -552,7 +584,8 @@ class ResourcePool:
         here: if they disagreed, a job could pass submission and then never be
         placed.
         """
-        return len(self.node_cpus) if req.exclusive and not req.numa_local else 1
+        confined = req.numa_local_mem or (req.numa_local_gpu and req.gpu_cores > 0)
+        return len(self.node_cpus) if req.exclusive and not confined else 1
 
     def _cpu_node_order(
         self, req: Request, only: int | None, max_nodes: int, near: set[int]
@@ -579,7 +612,7 @@ class ResourcePool:
                 local,
                 key=lambda n: (n not in near, len(self.free_cpus[n]), self._free_mem(n), n),
             )
-        if req.numa_local:
+        if req.numa_local_mem:
             return []
         # The budget has to span nodes. Here memory leads, ahead of even
         # ``near``: this job is already going to pay for remote access, so the
@@ -610,20 +643,51 @@ class ResourcePool:
                 nodes.append(node)
         return (cpus, nodes) if len(cpus) == req.cpu else None
 
-    def _pick_gpus(self, count: int, *, search: bool = True) -> list[int]:
-        """``count`` free GPUs: the closest-connected set, or the lowest free
-        indices when there is no topology to consult, when the free GPUs are
-        exactly used up either way, or when ``search`` is off.
-
-        The set is found by climbing the machine's own structure rather than
-        by scoring every combination: at each level of the interconnect, only
-        the islands wide enough to hold the job are looked inside, and the
-        first level that really delivers a set that good is the best the job
-        can get — anything better would have been a whole island one level
-        down, where there was no island big enough.
+    def _gpu_pools(self, req: Request) -> list[list[int]]:
+        """The free GPUs this request may draw from, as the sets one of which
+        has to hold all of them: the whole machine, or a node's worth each
+        when the job asked to stay on one node.
         """
         free = sorted(self.free_gpus)
-        if not search or count <= 0 or count >= len(free) or not self.gpu_topology:
+        if not req.numa_local_gpu:
+            return [free]
+        by_node: dict[int, list[int]] = {}
+        for gpu in free:
+            node = self.gpu_topology.numa_node.get(gpu)
+            if node is not None:
+                by_node.setdefault(node, []).append(gpu)
+        return [by_node[node] for node in sorted(by_node)]
+
+    def _pick_gpus(self, req: Request, *, search: bool = True) -> list[int] | None:
+        """The GPUs to give this request, or None when the free ones cannot
+        satisfy it and the job has to wait.
+
+        ``search`` off takes them in index order rather than looking for the
+        closest set: which GPUs a job gets never decides whether it fits, so a
+        caller only asking that question need not pay for the search.
+        """
+        count = req.gpu_cores
+        pools = [pool for pool in self._gpu_pools(req) if len(pool) >= count]
+        if not pools:
+            return None
+        if count <= 0 or not search or not self.gpu_topology:
+            return pools[0][:count]
+        return min(
+            (self._closest_gpus(pool, count) for pool in pools),
+            key=self.gpu_topology.quality,
+        )
+
+    def _closest_gpus(self, free: list[int], count: int) -> list[int]:
+        """The closest-connected ``count`` of ``free``.
+
+        Found by climbing the machine's own structure rather than by scoring
+        every combination: at each level of the interconnect, only the islands
+        wide enough to hold the job are looked inside, and the first level that
+        really delivers a set that good is the best the job can get — anything
+        better would have been a whole island one level down, where there was
+        no island big enough.
+        """
+        if count >= len(free):
             return free[:count]
         topo = self.gpu_topology
         for level in range(len(_LINK_CLASSES) + 1):
@@ -683,7 +747,7 @@ class ResourcePool:
             return {}
         home_key = self.mem_key(home)
         order = [home_key]
-        if not req.numa_local:
+        if not req.numa_local_mem:
             order += [k for k in sorted(self.free_mem_gb) if k != home_key]
         charge: dict[int, float] = {}
         remaining = req.mem_gb
@@ -713,8 +777,18 @@ class ResourcePool:
             return None
         # GPUs first: they are the fixed points here — a job cannot be moved
         # to the other end of the machine, but its cpus can be placed near it.
-        gpus = self._pick_gpus(req.gpu_cores, search=place_gpus)
+        gpus = self._pick_gpus(req, search=place_gpus)
+        if gpus is None:
+            return None
         near = self.gpu_topology.nodes_for(gpus)
+        if req.numa_local_gpu and near:
+            # Kept whole: the node owning its gpus has to own its cpus too, so
+            # what feeds them never crosses the interconnect. _gpu_pools has
+            # already made that one node.
+            home = min(near)
+            if node is not None and node != home:
+                return None
+            node = home
         picked = self._pick_cpus(req, node, self._max_nodes(req), near)
         if picked is None:
             return None

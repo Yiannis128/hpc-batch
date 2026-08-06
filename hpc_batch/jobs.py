@@ -20,7 +20,8 @@ class Job:
     max_mem_gb: float | None
     max_time_s: int
     exclusive: bool
-    numa_local: bool = False
+    numa_local_mem: bool = False
+    numa_local_gpu: bool = False
     env: dict[str, str] = field(default_factory=dict)  # --env, dropped at start; {} = clean
     mem_defaulted: bool = False  # budget assigned by us, not asked for
     state: str = QUEUED
@@ -72,7 +73,8 @@ class Job:
             gpu_cores=self.gpu_cores,
             mem_gb=self.max_mem_gb,
             exclusive=self.exclusive,
-            numa_local=self.numa_local,
+            numa_local_mem=self.numa_local_mem,
+            numa_local_gpu=self.numa_local_gpu,
         )
 
     def allocation(self) -> Allocation:
