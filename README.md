@@ -43,6 +43,17 @@ and benchmark timings are stable.
 - **GPUs**: `--gpu-cores N` allocates N of the GPUs enumerated by
   `nvidia-smi -L`; the job sees them via `CUDA_VISIBLE_DEVICES` (jobs that
   requested no GPUs get an empty `CUDA_VISIBLE_DEVICES`).
+- **Which GPUs is not arbitrary.** A multi-GPU job gets the
+  closest-connected free set in the interconnect that `nvidia-smi topo -m`
+  reports, not the lowest free indices: with GPU1 busy, index order hands a
+  2-GPU job GPU0+GPU2 across the machine even when GPU2+GPU3 share an
+  NVLink. A set is judged by its worst link first, because a collective runs
+  at the speed of its slowest pair, and the job's cpus then come from the
+  NUMA node its GPUs hang off. Adjacency is a preference and never a reason
+  to keep a job queued: when only distant GPUs are free the job takes them,
+  and the line logged at start-up names the link class it ended up with.
+  Where `nvidia-smi topo -m` is unavailable the daemon says so at startup and
+  falls back to index order.
 - **/dev/hpc-batch/jobs/**: every queued/running job appears as
   `/dev/hpc-batch/jobs/<id>` (a symlink to its state directory) containing
   `info.json` (metadata) and `output` (combined stdout/stderr). Entries are

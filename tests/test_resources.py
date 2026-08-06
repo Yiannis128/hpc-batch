@@ -1,13 +1,32 @@
+from hpc_batch import resources
 from hpc_batch.resources import (
     SHARED_MEM,
     Allocation,
+    GpuTopology,
     Request,
     ResourcePool,
     apply_reserve,
     discover_node_memory_gb,
     discover_numa_nodes,
     parse_cpu_list,
+    parse_gpu_topology,
 )
+
+#: `nvidia-smi topo -m` on a machine with two NVLinked GPU pairs, one pair per
+#: NUMA node and a SYS hop between them, plus an InfiniBand NIC (which takes a
+#: matrix column of its own without being a GPU).
+TOPO_OUTPUT = "\n".join(
+    "\t".join(row)
+    for row in [
+        ["", "GPU0", "GPU1", "GPU2", "GPU3", "mlx5_0",
+         "CPU Affinity", "NUMA Affinity", "GPU NUMA ID"],
+        ["GPU0", " X ", "NV2", "SYS", "SYS", "PIX", "0-3", "0", "N/A"],
+        ["GPU1", "NV2", " X ", "SYS", "SYS", "PIX", "0-3", "0", "N/A"],
+        ["GPU2", "SYS", "SYS", " X ", "NV2", "SYS", "4-7", "1", "N/A"],
+        ["GPU3", "SYS", "SYS", "NV2", " X ", "SYS", "4-7", "1", "N/A"],
+        ["mlx5_0", "PIX", "PIX", "SYS", "SYS", " X ", "", "", ""],
+    ]
+) + "\n\nLegend:\n\n  X    = Self\n  SYS  = Connection traversing PCIe\n"
 
 
 def make_pool() -> ResourcePool:
@@ -17,6 +36,16 @@ def make_pool() -> ResourcePool:
         node_cpus={0: [0, 1, 2, 3], 1: [4, 5, 6, 7]},
         gpu_ids=[0, 1, 2, 3],
         node_mem_gb={0: 32.0, 1: 32.0},
+    )
+
+
+def topo_pool() -> ResourcePool:
+    """`make_pool` on a machine whose GPU wiring we know: see TOPO_OUTPUT."""
+    return ResourcePool(
+        node_cpus={0: [0, 1, 2, 3], 1: [4, 5, 6, 7]},
+        gpu_ids=[0, 1, 2, 3],
+        node_mem_gb={0: 32.0, 1: 32.0},
+        gpu_topology=parse_gpu_topology(TOPO_OUTPUT),
     )
 
 
@@ -323,6 +352,130 @@ class TestSharedMemory:
         )
         assert pool.mem_confined is False
         assert pool.free_mem_gb == {SHARED_MEM: 32.0}
+
+
+class TestGpuTopologyParsing:
+    def test_reads_the_matrix_past_the_nic_columns(self):
+        topo = parse_gpu_topology(TOPO_OUTPUT)
+        assert topo
+        assert topo.link(0, 1) == "NV2" and topo.link(1, 0) == "NV2"
+        assert topo.link(0, 2) == "SYS"
+        assert topo.link(2, 3) == "NV2"
+        # The NIC has a row and a column, but it is not a GPU.
+        assert set(topo.links) == {(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)}
+        # Which needs the header's width: without it the NIC column would be
+        # read as the CPU affinity field and the NUMA one would be lost.
+        assert topo.numa_node == {0: 0, 1: 0, 2: 1, 3: 1}
+
+    def test_output_without_a_numa_affinity_column(self):
+        text = "\n".join(
+            "\t".join(row)
+            for row in [
+                ["", "GPU0", "GPU1", "CPU Affinity"],
+                ["GPU0", " X ", "PHB", "0-3"],
+                ["GPU1", "PHB", " X ", "0-3"],
+            ]
+        )
+        topo = parse_gpu_topology(text)
+        assert topo.link(0, 1) == "PHB"
+        assert topo.numa_node == {}
+
+    def test_unreadable_output_yields_no_topology(self):
+        for text in ["", "No devices found.", "Legend:\n\n  X = Self\n"]:
+            topo = parse_gpu_topology(text)
+            assert not topo and topo.numa_node == {}
+
+
+class TestGpuTopologyRanking:
+    def test_the_worst_link_leads(self):
+        # {0,1,2} is NVLinked twice but has one SYS hop; {0,1,3} is PIX at
+        # worst. A collective runs at the speed of its slowest pair.
+        topo = GpuTopology(links={
+            (0, 1): "NV1", (0, 2): "NV1", (1, 2): "SYS",
+            (0, 3): "PIX", (1, 3): "PIX", (2, 3): "PIX",
+        })
+        assert topo.rank([0, 1, 3]) < topo.rank([0, 1, 2])
+
+    def test_wider_nvlink_breaks_a_tie(self):
+        topo = GpuTopology(links={(0, 1): "NV1", (0, 2): "NV4", (1, 2): "NV1"})
+        assert topo.rank([0, 2]) < topo.rank([0, 1])
+
+    def test_unknown_links_sort_behind_every_known_one(self):
+        topo = GpuTopology(links={(0, 1): "SYS", (0, 2): "NVLINK-C2C"})
+        assert topo.rank([0, 1]) < topo.rank([0, 2])
+
+    def test_worst_link_names_the_pacing_hop(self):
+        topo = parse_gpu_topology(TOPO_OUTPUT)
+        assert topo.worst_link([0, 1]) == "NV2"
+        assert topo.worst_link([0, 1, 2]) == "SYS"
+        assert topo.worst_link([1]) is None
+
+
+class TestGpuPlacement:
+    def test_prefers_an_adjacent_pair_to_the_lowest_indices(self):
+        # The reported bug: with GPU1 busy, index order hands out 0+2, a pair
+        # on opposite sides of the machine, while 2+3 sit on one NVLink.
+        pool = topo_pool()
+        pool.reserve(held([0], node=0, gpus=[1]))
+        alloc = pool.allocate(req(gpu=2))
+        assert alloc is not None and alloc.gpus == [2, 3]
+
+    def test_index_order_when_the_topology_is_unknown(self):
+        pool = make_pool()
+        pool.reserve(held([0], node=0, gpus=[1]))
+        alloc = pool.allocate(req(gpu=2))
+        assert alloc is not None and alloc.gpus == [0, 2]
+
+    def test_takes_a_distant_pair_rather_than_waiting(self):
+        # Adjacency is a preference, never a reason to leave a job queued.
+        pool = topo_pool()
+        pool.reserve(held([0], node=0, gpus=[1, 3]))
+        alloc = pool.allocate(req(gpu=2))
+        assert alloc is not None and alloc.gpus == [0, 2]
+
+    def test_every_gpu_when_the_job_asks_for_all_of_them(self):
+        pool = topo_pool()
+        alloc = pool.allocate(req(cpu=4, gpu=4))
+        assert alloc is not None and alloc.gpus == [0, 1, 2, 3]
+
+    def test_greedy_fallback_picks_the_same_pair(self, monkeypatch):
+        # The path taken when there are too many candidate sets to score
+        # exhaustively; forced here, since no real machine has that many gpus.
+        monkeypatch.setattr(resources, "_MAX_GPU_LINK_SCANS", 0)
+        pool = topo_pool()
+        pool.reserve(held([0], node=0, gpus=[1]))
+        alloc = pool.allocate(req(gpu=2))
+        assert alloc is not None and alloc.gpus == [2, 3]
+
+    def test_cpus_land_on_the_node_the_gpus_hang_off(self):
+        pool = topo_pool()
+        pool.reserve(held([0], node=0, gpus=[0, 1]))
+        alloc = pool.allocate(req(cpu=2, gpu=1))
+        # Node 0 has fewer free cpus, so best fit alone would put it there;
+        # the only free gpus are on node 1, and feeding one from node 0 would
+        # cross the interconnect.
+        assert alloc is not None and alloc.gpus == [2]
+        assert alloc.numa_node == 1
+
+    def test_would_fit_agrees_with_allocate(self):
+        # would_fit skips the search for the best set, on the grounds that
+        # which gpus a job gets never decides whether it fits. If that ever
+        # stopped holding, jobs would be told they fit and then not start.
+        pool = topo_pool()
+        pool.reserve(held([0], node=0, gpus=[1]))
+        for request in [
+            req(gpu=2), req(cpu=4, gpu=3), req(cpu=4, gpu=4),
+            req(cpu=2, gpu=1, mem=64.0), req(cpu=2, gpu=1, mem=48.0, numa_local=True),
+        ]:
+            assert pool.would_fit(request) == (pool.clone().allocate(request) is not None)
+
+    def test_gpu_affinity_never_overrides_the_memory_budget(self):
+        pool = topo_pool()
+        pool.reserve(held([4], node=1, gpus=[0, 1], mem=30.0))
+        # Both best fit and the free gpus point at node 1, but it has 2 GiB
+        # left, so the budget still decides.
+        alloc = pool.allocate(req(cpu=2, gpu=1, mem=16.0))
+        assert alloc is not None and alloc.numa_node == 0
 
 
 class TestProportionalShare:

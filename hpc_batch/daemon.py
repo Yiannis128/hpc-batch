@@ -47,9 +47,11 @@ from .protocol import (
 )
 from .resources import (
     Allocation,
+    GpuTopology,
     Request,
     ResourcePool,
     apply_reserve,
+    discover_gpu_topology,
     discover_gpus,
     discover_node_memory_gb,
     discover_numa_nodes,
@@ -336,6 +338,7 @@ class Daemon:
     def _setup_pool(self) -> None:
         nodes = discover_numa_nodes()
         gpus = discover_gpus()
+        topology = discover_gpu_topology() if gpus else GpuTopology()
         node_mem = discover_node_memory_gb(nodes)
         # Memory is only confined to a node when we can actually write
         # cpuset.mems. Under --no-cgroups a job can allocate from any node, so
@@ -349,8 +352,14 @@ class Daemon:
             nodes, node_mem, self.cfg.reserve_cpu, self.cfg.reserve_mem
         )
         self.pool = ResourcePool(
-            node_cpus=nodes, gpu_ids=gpus, node_mem_gb=node_mem, mem_confined=confined
+            node_cpus=nodes, gpu_ids=gpus, node_mem_gb=node_mem, mem_confined=confined,
+            gpu_topology=topology,
         )
+        if len(gpus) > 1 and not topology:
+            log.warning(
+                "gpu topology unavailable (nvidia-smi topo -m); multi-gpu jobs will "
+                "get the lowest free indices, which can straddle the interconnect"
+            )
         log.info(
             "resources available to jobs: %d cpus over %d NUMA node(s), %d gpu(s), "
             "%.0f GiB memory (%s); reserved for the system: %d cpu, %g GiB",
@@ -685,10 +694,19 @@ class Daemon:
             job.id, job.pid,
             format_id_list(alloc.numa_nodes),
             format_id_list(alloc.cpus),
-            f", gpus {format_id_list(alloc.gpus)}" if alloc.gpus else "",
+            self._gpu_note(alloc),
             format_id_list(alloc.mem_nodes()),
             " (spans nodes: remote memory is slower)" if alloc.spans_nodes else "",
         )
+
+    def _gpu_note(self, alloc: Allocation) -> str:
+        """The gpus a job got, and the link class pacing them: on a machine
+        where the free gpus were not adjacent, that is the difference between
+        a run being slow and being slow *for a reason you can see*."""
+        if not alloc.gpus:
+            return ""
+        link = self.pool.gpu_topology.worst_link(alloc.gpus)
+        return f", gpus {format_id_list(alloc.gpus)}" + (f" over {link}" if link else "")
 
     def _job_env(self, job: Job, pw: pwd.struct_passwd, alloc: Allocation) -> dict[str, str]:
         defaults = {
