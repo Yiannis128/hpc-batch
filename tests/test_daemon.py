@@ -189,9 +189,8 @@ class TestRetireOutput:
         assert not daemon.output_path(1).exists()
 
     def test_a_job_killed_off_the_queue_delivers_nothing(self, tmp_path):
-        # It never ran, so there is no buffer and nothing was lost. Reporting
-        # a delivery failure here left every cancelled job warning about
-        # output that never existed, for the rest of its retention.
+        # Reporting a delivery failure here left every cancelled job warning
+        # about output that never existed, for the rest of its retention.
         daemon = make_daemon(tmp_path)
         job = add_job(daemon, 1, output=False)
         job.start_time = None

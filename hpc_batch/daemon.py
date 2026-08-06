@@ -735,10 +735,9 @@ class Daemon:
         because it is then the only copy left.
         """
         src = self.output_path(job.id)
-        # A job killed off the queue never opened a buffer: nothing to hand
-        # over, so no delivery to have failed. Not a start_time test -- a job
-        # that failed in _try_start also never started, but its buffer holds
-        # the reason and still has to reach the user.
+        # Not a start_time test: a job that failed in _try_start also never
+        # started, but its buffer holds the reason and still has to reach the
+        # user.
         if job.output_dest and src.exists():
             dest = Path(job.output_dest)
 
