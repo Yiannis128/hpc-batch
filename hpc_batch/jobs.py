@@ -22,6 +22,7 @@ class Job:
     exclusive: bool
     numa_local_mem: bool = False
     numa_local_gpu: bool = False
+    min_gpu_link: str | None = None  # worst gpu link the job will accept
     env: dict[str, str] = field(default_factory=dict)  # --env, dropped at start; {} = clean
     mem_defaulted: bool = False  # budget assigned by us, not asked for
     state: str = QUEUED
@@ -37,6 +38,7 @@ class Job:
     numa_nodes: list[int] = field(default_factory=list)  # every node its cpus span
     mem_by_node: dict[int, float] = field(default_factory=dict)  # exact charge
     gpus: list[int] = field(default_factory=list)
+    gpu_link: str | None = None  # link class it actually got
     cgroup: str | None = None
     term_time: float | None = None  # when SIGTERM was sent, for escalation
     output_dest: str | None = None  # user's durable copy; None = don't save one
@@ -75,6 +77,7 @@ class Job:
             exclusive=self.exclusive,
             numa_local_mem=self.numa_local_mem,
             numa_local_gpu=self.numa_local_gpu,
+            min_gpu_link=self.min_gpu_link,
         )
 
     def allocation(self) -> Allocation:
@@ -136,8 +139,11 @@ class Job:
             "max_mem_gb": self.max_mem_gb,
             "mem_defaulted": self.mem_defaulted,
             # Remote memory is slower, so a job that had to spread its budget
-            # says so rather than quietly producing worse timings.
+            # says so rather than quietly producing worse timings. Same for the
+            # link its gpus ended up talking over.
             "mem_spans_nodes": len(charged_nodes(self.mem_by_node)) > 1,
+            "gpus": len(self.gpus),
+            "gpu_link": self.gpu_link,
             "state": self.state,
             "exit_code": self.exit_code,
             "reason": self.reason,

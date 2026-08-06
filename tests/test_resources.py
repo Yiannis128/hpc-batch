@@ -68,9 +68,10 @@ def quad_pool() -> ResourcePool:
 
 
 def req(cpu=1, gpu=0, mem=None, exclusive=False,
-        numa_local_mem=False, numa_local_gpu=False) -> Request:
+        numa_local_mem=False, numa_local_gpu=False, min_gpu_link=None) -> Request:
     return Request(cpu=cpu, gpu_cores=gpu, mem_gb=mem, exclusive=exclusive,
-                   numa_local_mem=numa_local_mem, numa_local_gpu=numa_local_gpu)
+                   numa_local_mem=numa_local_mem, numa_local_gpu=numa_local_gpu,
+                   min_gpu_link=min_gpu_link)
 
 
 def held(cpus, node=0, gpus=(), mem=None) -> Allocation:
@@ -552,6 +553,28 @@ class TestGpuPlacement:
         pool.reserve(held([0], node=0, gpus=[0, 1, 2, 3]))
         assert pool.allocate(req(cpu=2, gpu=2, numa_local_gpu=True), node=0) is None
 
+    def test_gpu_link_waits_for_a_set_wired_well_enough(self):
+        pool = quad_pool()
+        pool.reserve(held([0], node=0, gpus=[0, 1, 2]))
+        pool.reserve(held([8], node=1, gpus=[4, 5, 6]))
+        # One gpu free per quad, so the only pair left talks over SYS.
+        assert pool.allocate(req(cpu=2, gpu=2, min_gpu_link="NV")) is None
+        assert pool.allocate(req(cpu=2, gpu=2, min_gpu_link="PXB")) is None
+        # The same job without a floor takes the distant pair.
+        alloc = pool.allocate(req(cpu=2, gpu=2))
+        assert alloc is not None and alloc.gpus == [3, 7]
+
+    def test_gpu_link_is_satisfied_by_a_close_enough_set(self):
+        pool = quad_pool()
+        alloc = pool.allocate(req(cpu=2, gpu=4, min_gpu_link="NV"))
+        assert alloc is not None and alloc.gpus == [0, 1, 2, 3]
+
+    def test_gpu_link_ignores_a_job_with_nothing_to_pair(self):
+        pool = quad_pool()
+        pool.reserve(held([0], node=0, gpus=[0, 1, 2, 3, 4, 5, 6]))
+        # A lone gpu has no link to be unhappy about.
+        assert pool.allocate(req(cpu=2, gpu=1, min_gpu_link="NV")) is not None
+
     def test_would_fit_agrees_with_allocate(self):
         # would_fit skips the search for the best set, on the grounds that
         # which gpus a job gets never decides whether it fits. If that ever
@@ -664,6 +687,23 @@ class TestValidate:
         problem = pool.validate(req(cpu=2, gpu=5, numa_local_gpu=True))
         assert problem is not None and "--numa-local-gpu" in problem
         assert pool.validate(req(cpu=2, gpu=5)) is None
+
+    def test_gpu_link_is_capped_by_what_the_machine_wires(self):
+        pool = quad_pool()  # NVLinked quads, SYS between them
+        assert pool.validate(req(cpu=2, gpu=4, min_gpu_link="NV")) is None
+        # No 5 gpus anywhere on this machine share an NVLink, however long
+        # the job waits.
+        problem = pool.validate(req(cpu=2, gpu=5, min_gpu_link="NV"))
+        assert problem is not None and "NV or better" in problem
+        # Without a floor the same job is merely unavailable, so it queues.
+        assert pool.validate(req(cpu=2, gpu=5)) is None
+
+    def test_gpu_link_needs_a_topology_at_all(self):
+        pool = make_pool()
+        problem = pool.validate(req(gpu=2, min_gpu_link="PIX"))
+        assert problem is not None and "nvidia-smi topo -m" in problem
+        # One gpu has no pair, so the floor cannot be violated.
+        assert pool.validate(req(gpu=1, min_gpu_link="PIX")) is None
 
     def test_numa_local_gpu_needs_a_topology_that_names_the_nodes(self):
         pool = make_pool()  # gpus, but nothing says where they hang off

@@ -511,6 +511,7 @@ class Daemon:
             exclusive = bool(req.get("exclusive"))
             numa_local_mem = bool(req.get("numa_local_mem"))
             numa_local_gpu = bool(req.get("numa_local_gpu"))
+            min_gpu_link = req.get("min_gpu_link") or None
             # An exclusive job owns the machine, so "unspecified" means all
             # of it rather than a single core.
             default_cpu = self.pool.total_cpus() if exclusive else 1
@@ -530,7 +531,8 @@ class Daemon:
             mem_gb = self._default_mem_gb(cpu, exclusive)
 
         problem = self.pool.validate(
-            Request(cpu, gpu_cores, mem_gb, exclusive, numa_local_mem, numa_local_gpu)
+            Request(cpu, gpu_cores, mem_gb, exclusive, numa_local_mem,
+                    numa_local_gpu, min_gpu_link)
         )
         if problem:
             return err(problem)
@@ -568,6 +570,7 @@ class Daemon:
             exclusive=exclusive,
             numa_local_mem=numa_local_mem,
             numa_local_gpu=numa_local_gpu,
+            min_gpu_link=min_gpu_link,
             env=env,
             mem_defaulted=mem_defaulted,
             submit_time=time.time(),
@@ -689,6 +692,9 @@ class Daemon:
         job.numa_nodes = list(alloc.numa_nodes)
         job.mem_by_node = dict(alloc.mem_by_node)
         job.gpus = list(alloc.gpus)
+        # Recorded now rather than derived on demand: `dispatch list` has no
+        # topology, and a reload could hand it a different one.
+        job.gpu_link = self.pool.gpu_topology.worst_link(alloc.gpus)
         job.cgroup = str(cg) if cg is not None else None
         # Only a queued job needs it; a re-adopted one is never re-spawned.
         # Keeping it would persist the submitter's secrets for the job's whole

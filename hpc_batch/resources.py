@@ -71,6 +71,10 @@ _MEMTOTAL_LINE = re.compile(r"^Node \d+ MemTotal:\s+(\d+) kB")
 #: Link classes from the legend of `nvidia-smi topo -m`, closest first.
 _LINK_CLASSES = ("NV", "PIX", "PXB", "PHB", "NODE", "SYS")
 
+#: What `--gpu-link` accepts. SYS is left out: it is the worst class there is,
+#: so demanding it would rule nothing out.
+GPU_LINK_CHOICES = _LINK_CLASSES[:-1]
+
 #: Links we will score to choose between the GPU sets one island offers. Past
 #: this the island is taken apart into the finer ones inside it instead, which
 #: is both cheaper and what the answer looks like anyway at that width. No
@@ -385,6 +389,7 @@ class Request:
     exclusive: bool = False
     numa_local_mem: bool = False
     numa_local_gpu: bool = False
+    min_gpu_link: str | None = None  # worst link class the job will accept
 
 
 @dataclass
@@ -535,6 +540,23 @@ class ResourcePool:
                 )
         if req.gpu_cores > len(self.gpu_ids):
             return f"--gpu-cores {req.gpu_cores} exceeds the {len(self.gpu_ids)} gpus on this machine"
+        if req.min_gpu_link and req.gpu_cores > 1:
+            if not self.gpu_topology:
+                return (
+                    f"--gpu-link {req.min_gpu_link} needs the wiring that "
+                    "`nvidia-smi topo -m` reports, and this machine does not give it"
+                )
+            # Only a group already joined at that class can hold such a set, so
+            # the widest one is the ceiling. Being wide enough does not prove a
+            # set exists inside it — NVLink is a mesh — so a request that fits
+            # here can still have to wait.
+            level = _link_rank(req.min_gpu_link)
+            widest = max(len(i) for i in self.gpu_topology.islands(self.gpu_ids, level))
+            if req.gpu_cores > widest:
+                return (
+                    f"--gpu-cores {req.gpu_cores} exceeds the {widest} gpus this "
+                    f"machine connects at {req.min_gpu_link} or better"
+                )
         if req.numa_local_gpu and req.gpu_cores:
             per_node = self.gpus_by_node()
             if not per_node:
@@ -779,6 +801,12 @@ class ResourcePool:
         # to the other end of the machine, but its cpus can be placed near it.
         gpus = self._pick_gpus(req, search=place_gpus)
         if gpus is None:
+            return None
+        if req.min_gpu_link and self.gpu_topology.quality(gpus).worst > _link_rank(
+            req.min_gpu_link
+        ):
+            # The closest set free right now is still not close enough. Nothing
+            # else would be either: the search minimises the pacing link first.
             return None
         near = self.gpu_topology.nodes_for(gpus)
         if req.numa_local_gpu and near:

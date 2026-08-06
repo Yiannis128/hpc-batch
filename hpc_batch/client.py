@@ -14,6 +14,7 @@ import time
 
 from . import __version__
 from .protocol import DONE, MAX_LINE, OOM, QUEUED, encode, socket_path
+from .resources import GPU_LINK_CHOICES
 from .util import duration_arg, format_duration, format_gb, format_table, format_time
 
 
@@ -74,6 +75,7 @@ def cmd_new(args: argparse.Namespace, command: list[str]) -> int:
         "exclusive": args.exclusive,
         "numa_local_mem": args.numa_local or args.numa_local_mem,
         "numa_local_gpu": args.numa_local or args.numa_local_gpu,
+        "min_gpu_link": args.gpu_link,
         "env": dict(os.environ) if args.env else {},
         "output": output,
     }
@@ -105,13 +107,37 @@ def _exit_label(job: dict) -> str:
     return "-" if code is None else str(code)
 
 
+#: Link classes where a peer-to-peer copy has left the GPUs' own PCIe tree
+#: and is paying for it. Flagged in `dispatch list` the way spread memory is.
+_FAR_GPU_LINKS = ("PHB", "NODE", "SYS")
+
+
+def _gpu_link_is_far(job: dict) -> bool:
+    return job.get("gpu_link") in _FAR_GPU_LINKS
+
+
+def _gpu_label(job: dict) -> str:
+    """The GPU column: how many, and what they talk to each other over."""
+    count = job.get("gpus") or 0
+    if not count:
+        return "-"
+    link = job.get("gpu_link")  # absent for a 1-gpu job: there is no pair
+    return f"{count} {link}{'!' if _gpu_link_is_far(job) else ''}" if link else str(count)
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     resp = _request({"cmd": "list", "all": args.all, "finished": args.finished})
     jobs = resp.get("jobs", [])
     if not jobs:
         print("no jobs")
         return 0
-    headers = ["USER", "ID", "COMMAND", "START", "UPTIME", "MAX-TIME", "MEM", "EXCLUSIVE"]
+    headers = ["USER", "ID", "COMMAND", "START", "UPTIME", "MAX-TIME", "MEM"]
+    # Only where there are gpus to talk about: on a cpu-only machine the
+    # column would be a row of dashes.
+    show_gpus = any(job.get("gpus") for job in jobs)
+    if show_gpus:
+        headers += ["GPU"]
+    headers += ["EXCLUSIVE"]
     if args.finished:
         headers += ["STATE", "EXIT"]
     # The daemon stamps the response with the clock it built the rows against.
@@ -134,8 +160,10 @@ def cmd_list(args: argparse.Namespace) -> int:
             uptime,
             format_duration(job["max_time_s"]),
             label,
-            "yes" if job["exclusive"] else "no",
         ]
+        if show_gpus:
+            row += [_gpu_label(job)]
+        row += ["yes" if job["exclusive"] else "no"]
         if args.finished:
             row += [job["state"], _exit_label(job)]
         rows.append(row)
@@ -143,6 +171,10 @@ def cmd_list(args: argparse.Namespace) -> int:
     if any(job.get("mem_spans_nodes") for job in jobs):
         print("\n+ memory spans NUMA nodes; the remote part is slower to access. "
               "Use --numa-local-mem to wait for a node that fits instead.")
+    if any(_gpu_link_is_far(job) for job in jobs):
+        print("\n! these gpus reach each other across a host bridge or the "
+              "socket interconnect, so peer-to-peer copies are slower. Use "
+              "--gpu-link to wait for closer ones instead.")
     for job in jobs:
         if job.get("reason") == OOM:
             how = "assigned by default" if job.get("mem_defaulted") else "requested"
@@ -239,6 +271,15 @@ def build_parser() -> argparse.ArgumentParser:
                             "and the cpus come from that node, waiting if "
                             "necessary, instead of reaching across the "
                             "interconnect")
+    p_new.add_argument("--gpu-link", type=str.upper, default=None, metavar="CLASS",
+                       choices=GPU_LINK_CHOICES,
+                       help="refuse gpus wired worse than this to each other, "
+                            "waiting instead: one of "
+                            f"{', '.join(GPU_LINK_CHOICES)} (closest first, as "
+                            "`nvidia-smi topo -m` names them). NV demands "
+                            "NVLink; PXB or better keeps a set behind one PCIe "
+                            "host bridge, where peer-to-peer copies do not have "
+                            "to go through host memory")
     p_new.add_argument("--max-time", type=duration_arg, default=None, metavar="DURATION",
                        help="kill the job after this long, e.g. 30m or 2h "
                             "(default and upper bound: the admin's max lifetime)")

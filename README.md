@@ -69,6 +69,21 @@ and benchmark timings are stable.
   on a machine where `nvidia-smi topo -m` does not say which node a GPU
   belongs to. `--numa-local` turns this on together with `--numa-local-mem`,
   which is the way to ask for a job that is local in every respect.
+- **`--gpu-link CLASS` names the worst wiring you will accept**, out of `NV`,
+  `PIX`, `PXB`, `PHB` and `NODE` (closest first, as `nvidia-smi topo -m`
+  names them); anything worse and the job waits. This is a finer thing than
+  NUMA locality, and not implied by it: `NODE` is by definition a hop between
+  PCIe host bridges *within* one NUMA node, so `--numa-local-gpu` alone can
+  still hand you a pair whose peer-to-peer copies are staged through host
+  memory rather than going card to card. `--gpu-link PXB` keeps a set inside
+  one host bridge, where they are not; `--gpu-link NV` demands NVLink, for a
+  job whose collectives are what it is measuring. Asking for more GPUs than
+  the machine wires that closely is refused at submit time.
+- **`dispatch list` shows what a job got.** The `GPU` column gives the count
+  and the link class pacing them, `!` marking a set that reaches across a
+  host bridge or the socket interconnect, with the same footnote treatment as
+  the `+` on spread memory. The column is only shown when some job in the
+  listing has GPUs at all.
 - **/dev/hpc-batch/jobs/**: every queued/running job appears as
   `/dev/hpc-batch/jobs/<id>` (a symlink to its state directory) containing
   `info.json` (metadata) and `output` (combined stdout/stderr). Entries are
@@ -265,6 +280,10 @@ dispatch new --cpu 4 --max-mem 64 --numa-local-mem -- ./latency_sensitive_bench
 # Keep the whole job on one node, memory and gpus alike, waiting for a node
 # that can hold all of it rather than reaching across the interconnect:
 dispatch new --cpu 8 --gpu-cores 2 --max-mem 64 --numa-local -- ./collective_bench
+
+# Measuring collectives: wait for gpus that share an NVLink, rather than run
+# on whatever is free and get numbers paced by PCIe:
+dispatch new --cpu 8 --gpu-cores 4 --gpu-link NV -- ./allreduce_bench
 
 # List my jobs / all jobs (all = admins, or everyone with --list-is-public):
 dispatch list

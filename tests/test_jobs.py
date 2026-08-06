@@ -111,6 +111,7 @@ class TestJob:
             "user", "id", "command", "start_time", "uptime_s", "max_time_s",
             "exclusive", "state", "exit_code", "reason", "output_dest",
             "output_error", "max_mem_gb", "mem_defaulted", "mem_spans_nodes",
+            "gpus", "gpu_link",
         }
         assert row["state"] == QUEUED
         assert row["start_time"] is None  # queued: it has not started yet
