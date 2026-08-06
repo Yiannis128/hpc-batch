@@ -67,7 +67,7 @@ and benchmark timings are stable.
   set by the daemon and a forwarded value never wins: the latter is how a
   job is held to the gpus it was allocated. A forwarded environment is
   stored with the job so a queued one survives a daemon restart, which is
-  why the state file is root-only.
+  why the state file is root-only; it is dropped once the job starts.
 - **Hot reload**: `systemctl reload hpc-batch` makes the daemon persist its
   state and re-exec itself in place. Running jobs are *not* killed; they are
   re-adopted by the new daemon (pid-reuse is guarded by comparing
