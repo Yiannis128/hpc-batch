@@ -8,18 +8,98 @@ mistake in it silently turns a hard guarantee into a hope.
 
 from pathlib import Path
 
+from hpc_batch import cgroup as cgroup_mod
 from hpc_batch.cgroup import CgroupManager
 
 
 def manager(tmp_path: Path, controllers=("cpuset", "memory")) -> CgroupManager:
-    cg = CgroupManager(enabled=True)
-    cg.base = tmp_path
+    cg = CgroupManager(enabled=True, root=tmp_path)
+    cg.ready = True
     cg.controllers = set(controllers)
     return cg
 
 
+def fake_cgroup_fs(tmp_path: Path, monkeypatch, controllers="cpuset memory pids") -> Path:
+    """A stand-in for /sys/fs/cgroup whose root delegates `controllers`."""
+    (tmp_path / "cgroup.controllers").write_text(controllers + "\n")
+    monkeypatch.setattr(cgroup_mod, "CGROUP_FS", tmp_path)
+    return tmp_path
+
+
 def read(path: Path, name: str) -> str:
     return (path / name).read_text()
+
+
+class TestSetup:
+    """The job subtree lives outside the daemon's service cgroup, and has to
+    survive the daemon being restarted underneath running jobs. These build
+    the interface files the kernel would materialise on mkdir."""
+
+    def test_claims_the_configured_subtree(self, tmp_path, monkeypatch):
+        fs = fake_cgroup_fs(tmp_path, monkeypatch)
+        root = fs / "hpc-batch"
+        root.mkdir()
+        (root / "cgroup.controllers").write_text("cpuset memory pids\n")
+
+        cg = CgroupManager(root=root)
+
+        assert cg.setup() is True
+        assert cg.controllers == {"cpuset", "memory"}
+        assert cg.create(1, cpus=[0], mems=[0], mem_bytes=None) == root / "job-1"
+
+    def test_a_restart_leaves_live_job_cgroups_alone(self, tmp_path, monkeypatch):
+        # The outage this guards against: a daemon coming back must adopt the
+        # cgroups of jobs that outlived it, not disturb or recreate them.
+        fs = fake_cgroup_fs(tmp_path, monkeypatch)
+        root = fs / "hpc-batch"
+        root.mkdir()
+        (root / "cgroup.controllers").write_text("cpuset memory\n")
+        live = root / "job-7"
+        live.mkdir()
+        (live / "cpuset.cpus").write_text("12-23")
+
+        assert CgroupManager(root=root).setup() is True
+
+        assert (live / "cpuset.cpus").read_text() == "12-23"
+
+    def test_creates_nothing_outside_its_own_subtree(self, tmp_path, monkeypatch):
+        # Putting jobs in the service cgroup is what made the unit
+        # unrestartable once a job outlived it, so setup writes nowhere else.
+        fs = fake_cgroup_fs(tmp_path, monkeypatch)
+        service = fs / "system.slice" / "hpc-batch.service"
+        service.mkdir(parents=True)
+        (service / "cgroup.procs").write_text("1234\n")
+        root = fs / "hpc-batch"
+        root.mkdir()
+        (root / "cgroup.controllers").write_text("cpuset memory\n")
+
+        CgroupManager(root=root).setup()
+
+        assert list(service.iterdir()) == [service / "cgroup.procs"]
+
+    def test_a_controller_the_kernel_root_withholds_is_skipped(self, tmp_path, monkeypatch):
+        fs = fake_cgroup_fs(tmp_path, monkeypatch)
+        root = fs / "hpc-batch"
+        root.mkdir()
+        (root / "cgroup.controllers").write_text("memory\n")
+
+        cg = CgroupManager(root=root)
+
+        assert cg.setup() is True
+        assert cg.controllers == {"memory"}
+
+    def test_without_cgroup_v2_jobs_fall_back_to_affinity(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cgroup_mod, "CGROUP_FS", tmp_path)  # no cgroup.controllers
+        cg = CgroupManager(root=tmp_path / "hpc-batch")
+
+        assert cg.setup() is False
+        assert cg.create(1, cpus=[0], mems=[0], mem_bytes=None) is None
+
+    def test_disabled_by_configuration(self, tmp_path):
+        cg = CgroupManager(enabled=False, root=tmp_path / "hpc-batch")
+
+        assert cg.setup() is False
+        assert not (tmp_path / "hpc-batch").exists()
 
 
 class TestCreate:
@@ -57,7 +137,7 @@ class TestCreate:
         assert not (path / "cpuset.cpus").exists()
         assert read(path, "memory.max") == str(1 << 30)
 
-    def test_returns_none_without_a_delegated_subtree(self, tmp_path):
+    def test_returns_none_before_setup_has_claimed_a_subtree(self, tmp_path):
         cg = CgroupManager(enabled=True)
         assert cg.create(12, cpus=[0], mems=[0], mem_bytes=None) is None
 

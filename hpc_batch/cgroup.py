@@ -1,11 +1,16 @@
 """cgroup v2 management for job isolation.
 
-The daemon runs as a systemd service with Delegate=, so it owns its own
-cgroup subtree. To create child cgroups we first move ourselves into a
-`supervisor` leaf (cgroup v2 forbids processes in inner nodes), enable the
-controllers we need on the service cgroup, then place every job in its own
-`job-<id>` child with cpuset (cpus pinned to one NUMA node) and memory
-limits applied.
+Jobs go in `/sys/fs/cgroup/hpc-batch/job-<id>`, with cpuset (cpus pinned to
+one NUMA node) and memory limits applied. That tree is the daemon's own,
+deliberately outside its service cgroup.
+
+Nesting jobs under the service is the obvious layout and Delegate= invites
+it, but it makes the unit unrestartable. cgroup v2 forbids processes in a
+cgroup that has controllers enabled for its children, so once KillMode=
+process leaves jobs behind on stop, systemd cannot put a new daemon into
+the service cgroup and the start fails with 219/CGROUP -- for as long as
+any job lives. A separate tree is untouched by anything systemd does to
+the unit, which is what lets a restarted daemon re-adopt running jobs.
 
 Everything degrades gracefully: when cgroups are unavailable (not root,
 no cgroup v2, missing controllers) the daemon falls back to
@@ -21,63 +26,54 @@ from .resources import format_id_list
 log = logging.getLogger(__name__)
 
 CGROUP_FS = Path("/sys/fs/cgroup")
+DEFAULT_ROOT = CGROUP_FS / "hpc-batch"
 _WANTED_CONTROLLERS = ("cpuset", "memory")
 
 
-def _own_cgroup() -> Path | None:
-    """Absolute path of the cgroup this process lives in (v2 only)."""
-    try:
-        for line in Path("/proc/self/cgroup").read_text().splitlines():
-            if line.startswith("0::"):
-                rel = line[3:].strip("/")
-                return CGROUP_FS / rel if rel else CGROUP_FS
-    except OSError:
-        pass
-    return None
-
-
 class CgroupManager:
-    def __init__(self, enabled: bool = True):
+    def __init__(self, enabled: bool = True, root: Path = DEFAULT_ROOT):
         self.enabled = enabled
-        self.base: Path | None = None
+        self.root = root
+        self.ready = False
         self.controllers: set[str] = set()
 
     def setup(self) -> bool:
-        """Claim our delegated subtree. Returns True when cgroups are usable."""
+        """Create and claim the job subtree. Returns True when cgroups are
+        usable.
+
+        Idempotent over an existing tree, because that is the restart case:
+        the job cgroups of everything still running are sitting in it, and a
+        daemon that has just come back has to adopt them, not disturb them.
+        """
         if not self.enabled:
             log.info("cgroups disabled by configuration")
             return False
-        own = _own_cgroup()
-        if own is None or not (CGROUP_FS / "cgroup.controllers").exists():
+        if not (CGROUP_FS / "cgroup.controllers").exists():
             log.warning("cgroup v2 not available; jobs will not be isolated")
             return False
-        # After a re-exec we are already inside the supervisor leaf.
-        base = own.parent if own.name == "supervisor" else own
-        if base == CGROUP_FS:
-            log.warning("refusing to manage the cgroup root; jobs will not be isolated")
-            return False
         try:
-            supervisor = base / "supervisor"
-            supervisor.mkdir(exist_ok=True)
-            # Move every process (normally just us) out of the inner node.
-            procs = (base / "cgroup.procs").read_text().split()
-            for pid in procs:
-                (supervisor / "cgroup.procs").write_text(pid)
-            available = set((base / "cgroup.controllers").read_text().split())
+            self.root.mkdir(exist_ok=True)
+            available = set((self.root / "cgroup.controllers").read_text().split())
             for ctrl in _WANTED_CONTROLLERS:
                 if ctrl not in available:
-                    log.warning("cgroup controller %r not delegated to us", ctrl)
+                    log.warning(
+                        "cgroup controller %r not enabled for %s; the kernel "
+                        "root must delegate it", ctrl, self.root,
+                    )
                     continue
                 try:
-                    (base / "cgroup.subtree_control").write_text(f"+{ctrl}")
+                    (self.root / "cgroup.subtree_control").write_text(f"+{ctrl}")
                     self.controllers.add(ctrl)
                 except OSError as exc:
                     log.warning("could not enable cgroup controller %r: %s", ctrl, exc)
         except OSError as exc:
             log.warning("cgroup setup failed (%s); jobs will not be isolated", exc)
             return False
-        self.base = base
-        log.info("cgroup subtree %s ready (controllers: %s)", base, ", ".join(sorted(self.controllers)) or "none")
+        self.ready = True
+        log.info(
+            "cgroup subtree %s ready (controllers: %s)",
+            self.root, ", ".join(sorted(self.controllers)) or "none",
+        )
         return True
 
     def create(
@@ -94,9 +90,9 @@ class CgroupManager:
         those nodes is what makes the accounting binding: the job cannot
         allocate memory on a node nobody budgeted for it.
         """
-        if self.base is None:
+        if not self.ready:
             return None
-        path = self.base / f"job-{job_id}"
+        path = self.root / f"job-{job_id}"
         path.mkdir(exist_ok=True)
         if "cpuset" in self.controllers:
             (path / "cpuset.cpus").write_text(format_id_list(cpus))

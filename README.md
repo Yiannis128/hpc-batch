@@ -11,10 +11,11 @@ and benchmark timings are stable.
 - **FIFO queue with pluggable scheduling** (`--schedule`, see below): jobs
   are always considered in submission order; the policy decides whether a
   later job may fill resources a blocked job cannot use.
-- **cgroups v2**: each job runs in its own cgroup under the daemon's
-  delegated subtree with `cpuset.cpus`, `cpuset.mems` (same NUMA node as
-  the allocated CPUs) and `memory.max` applied. Swap is disabled for every
-  job (`memory.swap.max=0`, reinforced by `MemorySwapMax=0` in the unit):
+- **cgroups v2**: each job runs in its own cgroup under `/sys/fs/cgroup/
+  hpc-batch` with `cpuset.cpus`, `cpuset.mems` (same NUMA node as the
+  allocated CPUs) and `memory.max` applied. That tree is deliberately not
+  the daemon's service cgroup, so restarting the unit never disturbs a
+  running job. Swap is disabled for every job (`memory.swap.max=0`):
   `--max-mem` is a hard RAM budget, and a job that exceeds it is
   OOM-killed as a whole group instead of thrashing in swap.
 - **Every job has a memory budget, whether or not it asks for one.** An
@@ -58,8 +59,11 @@ and benchmark timings are stable.
 - **Hot reload**: `systemctl reload hpc-batch` makes the daemon persist its
   state and re-exec itself in place. Running jobs are *not* killed; they are
   re-adopted by the new daemon (pid-reuse is guarded by comparing
-  `/proc/<pid>/stat` start times). The same applies to `systemctl restart`
-  thanks to `KillMode=process` + `Delegate=` in the unit.
+  `/proc/<pid>/stat` start times). The same applies to `systemctl restart`,
+  thanks to `KillMode=process` in the unit and to job cgroups living outside
+  it. Reload is still the better habit: it re-execs the same pid, so jobs
+  stay its children and their exit codes are still collected, where a full
+  restart can only see that they ended.
 
 ## Install
 

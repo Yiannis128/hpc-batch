@@ -18,11 +18,15 @@ Type=simple
 ExecStart=/usr/local/bin/hpc-batchd --max-lifetime 24h --admin-group wheel
 ExecReload=/bin/kill -HUP $MAINPID
 
-# The daemon manages its own cgroup subtree for jobs (cpuset + memory).
-Delegate=cpuset memory pids
-# Belt and braces: forbid swap for the whole subtree (daemon + all jobs).
-# The daemon also sets memory.swap.max=0 per job; swapping jobs would make
-# benchmark timings meaningless.
+# Jobs live in /sys/fs/cgroup/hpc-batch, which the daemon creates and owns,
+# NOT under this unit. Delegate= here would nest them in the service cgroup,
+# and surviving jobs would then make it impossible to restart: cgroup v2
+# refuses to hold a process in a cgroup whose children have controllers
+# enabled, so systemd would fail every start with 219/CGROUP until the last
+# job exited. Keeping the service cgroup a leaf is what makes it restartable.
+#
+# Covers the daemon only, for the same reason. Jobs get memory.swap.max=0
+# written into their own cgroup: swapping would wreck benchmark timings.
 MemorySwapMax=0
 # Only kill the daemon itself on stop/restart; jobs keep running and are
 # re-adopted when the daemon comes back.
