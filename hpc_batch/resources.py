@@ -52,6 +52,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
+from typing import NamedTuple
 
 log = logging.getLogger(__name__)
 
@@ -220,6 +221,14 @@ def _nvlink_width(label: str | None) -> int:
     return int(match.group(1)) if match else 0
 
 
+class LinkQuality(NamedTuple):
+    """A set of GPUs scored as a group, in the order the fields are compared."""
+
+    worst: int  # rank of the link pacing the set
+    total: int  # every pair's rank, summed
+    width: int  # NVLink lanes, negated so that more of them sorts first
+
+
 @dataclass(frozen=True)
 class GpuTopology:
     """The link class between each pair of GPUs, and the NUMA node each one
@@ -246,20 +255,19 @@ class GpuTopology:
     def _pairs(self, gpus: Iterable[int]) -> list[str | None]:
         return [self.link(a, b) for a, b in itertools.combinations(sorted(gpus), 2)]
 
-    def quality(self, gpus: Iterable[int]) -> tuple[int, int, int]:
+    def quality(self, gpus: Iterable[int]) -> "LinkQuality":
         """How good a set of GPUs is as a group, best first.
 
         The worst link leads because a collective runs at the speed of its
         slowest pair: four NVLinked GPUs and one across the machine is a
-        five-GPU job bound by that one hop. Total distance settles sets with
-        the same pacing link, and NVLink width (more is better) settles those.
+        five-GPU job bound by that one hop.
         """
         pairs = self._pairs(gpus)
         ranks = [_link_rank(link) for link in pairs]
-        return (
-            max(ranks, default=0),
-            sum(ranks),
-            -sum(_nvlink_width(link) for link in pairs),
+        return LinkQuality(
+            worst=max(ranks, default=0),
+            total=sum(ranks),
+            width=-sum(_nvlink_width(link) for link in pairs),
         )
 
     def islands(self, gpus: Iterable[int], level: int) -> list[list[int]]:
@@ -618,28 +626,28 @@ class ResourcePool:
         if not search or count <= 0 or count >= len(free) or not self.gpu_topology:
             return free[:count]
         topo = self.gpu_topology
-        chosen = free[:count]
         for level in range(len(_LINK_CLASSES) + 1):
-            best: tuple | None = None
-            for island in topo.islands(free, level):
-                if len(island) < count:
-                    continue
-                candidate = self._within_island(island, count, level)
-                # Between islands that would serve the job equally well, take
-                # from the one with least left to give, so whole islands stay
-                # whole for the jobs that need one. Same best-fit as cpu nodes
-                # get, and the ids only settle what that leaves tied.
-                key = (topo.quality(candidate), len(island), candidate)
-                if best is None or key < best:
-                    best = key
-            # Reaching this level joined an island's GPUs; it did not make
-            # them pairwise close, because NVLink is a mesh and not a
-            # hierarchy. So take the set only if it really is this good, and
-            # otherwise let the wider islands one level up be searched.
-            if best is not None and best[0][0] <= level:
-                chosen = best[2]
-                break
-        return chosen
+            roomy = [i for i in topo.islands(free, level) if len(i) >= count]
+            if not roomy:
+                continue
+            picks = [self._within_island(island, count, level) for island in roomy]
+            # Between islands that would serve the job equally well, take from
+            # the one with least left to give, so whole islands stay whole for
+            # the jobs that need one. Same best-fit as cpu nodes get, and the
+            # ids only settle what that leaves tied.
+            quality, _, gpus = min(
+                (topo.quality(pick), len(island), pick)
+                for island, pick in zip(roomy, picks)
+            )
+            # Reaching this level joined an island's GPUs; it did not make them
+            # pairwise close, because NVLink is a mesh and not a hierarchy. So
+            # take the set only if it really is this good, and otherwise let the
+            # wider islands one level up be searched.
+            if quality.worst <= level:
+                return gpus
+        # Unreachable: the last level joins every pair, known or not, so one of
+        # them always matched. Here to keep the function total.
+        return free[:count]
 
     def _within_island(self, island: list[int], count: int, level: int) -> list[int]:
         """``count`` GPUs from one island, best set first."""
