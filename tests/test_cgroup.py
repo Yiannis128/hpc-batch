@@ -31,6 +31,17 @@ def fake_cgroup_fs(tmp_path: Path, monkeypatch, controllers="cpuset memory") -> 
     return root
 
 
+def job_cgroup(root: Path, job_id: int, pids: str = "") -> Path:
+    """A job cgroup left behind by a previous daemon; `pids` is its
+    cgroup.procs. A job that ended is a bare directory: rmdir on real cgroupfs
+    ignores the interface files, but here they would block it."""
+    path = root / f"job-{job_id}"
+    path.mkdir()
+    if pids:
+        (path / "cgroup.procs").write_text(pids)
+    return path
+
+
 def read(path: Path, name: str) -> str:
     return (path / name).read_text()
 
@@ -53,13 +64,22 @@ class TestSetup:
         # The outage this guards against: a daemon coming back must adopt the
         # cgroups of jobs that outlived it, not disturb or recreate them.
         root = fake_cgroup_fs(tmp_path, monkeypatch)
-        live = root / "job-7"
-        live.mkdir()
+        live = job_cgroup(root, 7, pids="4242\n")
         (live / "cpuset.cpus").write_text("12-23")
 
         assert CgroupManager().setup() is True
 
         assert read(live, "cpuset.cpus") == "12-23"
+
+    def test_a_restart_reaps_the_cgroups_of_jobs_that_ended(self, tmp_path, monkeypatch):
+        # Nothing else does: the tree outlives the unit by design, and the
+        # busy-cgroup retry list is in memory only.
+        root = fake_cgroup_fs(tmp_path, monkeypatch)
+        dead = job_cgroup(root, 3)
+
+        assert CgroupManager().setup() is True
+
+        assert not dead.exists()
 
     def test_creates_nothing_outside_its_own_subtree(self, tmp_path, monkeypatch):
         # Putting jobs in the service cgroup is what made the unit

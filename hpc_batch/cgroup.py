@@ -56,6 +56,7 @@ class CgroupManager:
             log.warning("cgroup setup failed (%s); jobs will not be isolated", exc)
             return False
         self.ready = True
+        self._prune()
         log.info(
             "cgroup subtree %s ready (controllers: %s)",
             self.root, ", ".join(sorted(self.controllers)) or "none",
@@ -67,6 +68,28 @@ class CgroupManager:
                 "still has 'Delegate=cpuset memory pids'."
             )
         return True
+
+    def _prune(self) -> None:
+        """Remove job cgroups left behind by a previous daemon; nothing else
+        reaps them outside the service cgroup, and the list of cgroups still
+        busy at removal is in-memory only. A populated one is a job about to
+        be adopted, and rmdir refuses it in any case, so a lost state file
+        cannot turn every running job into an orphan."""
+        removed = 0
+        for path in self.root.glob("job-*"):
+            try:
+                pids = (path / "cgroup.procs").read_text().strip()
+            except OSError:
+                pids = ""  # let rmdir be the judge
+            if pids:
+                continue
+            try:
+                path.rmdir()
+            except OSError:
+                continue
+            removed += 1
+        if removed:
+            log.info("removed %d job cgroup(s) left by a previous daemon", removed)
 
     def create(
         self,
