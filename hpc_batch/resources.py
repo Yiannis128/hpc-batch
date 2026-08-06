@@ -497,8 +497,9 @@ class ResourcePool:
         """GPUs grouped by the NUMA node they hang off, the whole machine's by
         default. Empty when the topology does not say, which is what makes
         --numa-local-gpu unenforceable rather than merely unavailable."""
+        grouping = self.gpu_ids if gpus is None else gpus
         by_node: dict[int, list[int]] = {}
-        for gpu in self.gpu_ids if gpus is None else gpus:
+        for gpu in grouping:
             node = self.gpu_topology.numa_node.get(gpu)
             if node is not None:
                 by_node.setdefault(node, []).append(gpu)
@@ -687,21 +688,24 @@ class ResourcePool:
 
         ``search`` off takes them in index order rather than looking for the
         closest set, for a caller only asking whether the request fits: which
-        GPUs a job gets does not normally decide that. ``min_gpu_link`` is the
-        exception — under a floor, a set that fits is exactly a set the search
-        would have found — so it overrides ``search`` rather than letting the
-        two callers answer differently.
+        GPUs a job gets does not normally decide that. A ``min_gpu_link`` floor
+        is the exception, because then the closest set is the only one that can
+        clear it, so a floor searches whatever the caller asked for.
         """
         count = req.gpu_cores
         pools = [pool for pool in self._gpu_pools(req) if len(pool) >= count]
         if not pools:
             return None
-        if count <= 0 or not self.gpu_topology or not (search or req.min_gpu_link):
+        searching = search or bool(req.min_gpu_link)
+        if count <= 0 or not self.gpu_topology or not searching:
             return pools[0][:count]
-        return min(
-            (self._closest_gpus(pool, count) for pool in pools),
-            key=self.gpu_topology.quality,
+        quality, gpus = min(
+            (self.gpu_topology.quality(pick), pick)
+            for pick in (self._closest_gpus(pool, count) for pool in pools)
         )
+        if req.min_gpu_link and quality.worst > _link_rank(req.min_gpu_link):
+            return None
+        return gpus
 
     def _closest_gpus(self, free: list[int], count: int) -> list[int]:
         """The closest-connected ``count`` of ``free``.
@@ -805,12 +809,6 @@ class ResourcePool:
         # to the other end of the machine, but its cpus can be placed near it.
         gpus = self._pick_gpus(req, search=place_gpus)
         if gpus is None:
-            return None
-        if req.min_gpu_link and self.gpu_topology.quality(gpus).worst > _link_rank(
-            req.min_gpu_link
-        ):
-            # The closest set free right now is still not close enough. Nothing
-            # else would be either: the search minimises the pacing link first.
             return None
         near = self.gpu_topology.nodes_for(gpus)
         if req.numa_local_gpu and near:
