@@ -15,7 +15,11 @@ and benchmark timings are stable.
   hpc-batch` with `cpuset.cpus`, `cpuset.mems` (same NUMA node as the
   allocated CPUs) and `memory.max` applied. That tree is deliberately not
   the daemon's service cgroup, so restarting the unit never disturbs a
-  running job. Swap is disabled for every job (`memory.swap.max=0`):
+  running job. The unit still needs `Delegate=cpuset memory pids`, not to
+  nest anything under itself but because that is what makes systemd enable
+  those controllers at the cgroup root; without it the daemon drops to
+  affinity-only pinning and says so loudly at startup. Swap is disabled for
+  every job (`memory.swap.max=0`):
   `--max-mem` is a hard RAM budget, and a job that exceeds it is
   OOM-killed as a whole group instead of thrashing in swap.
 - **Every job has a memory budget, whether or not it asks for one.** An

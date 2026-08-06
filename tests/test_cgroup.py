@@ -77,7 +77,10 @@ class TestSetup:
 
         assert list(service.iterdir()) == [service / "cgroup.procs"]
 
-    def test_a_controller_the_kernel_root_withholds_is_skipped(self, tmp_path, monkeypatch):
+    def test_a_controller_the_kernel_root_withholds_is_skipped(self, tmp_path, monkeypatch, caplog):
+        # Losing cpuset costs NUMA isolation while everything still appears to
+        # work, so it has to be said outright rather than inferred from the
+        # controller list in the ready line.
         fs = fake_cgroup_fs(tmp_path, monkeypatch)
         root = fs / "hpc-batch"
         root.mkdir()
@@ -87,6 +90,17 @@ class TestSetup:
 
         assert cg.setup() is True
         assert cg.controllers == {"memory"}
+        assert "NO NUMA ISOLATION" in caplog.text
+
+    def test_a_full_subtree_says_nothing_alarming(self, tmp_path, monkeypatch, caplog):
+        fs = fake_cgroup_fs(tmp_path, monkeypatch)
+        root = fs / "hpc-batch"
+        root.mkdir()
+        (root / "cgroup.controllers").write_text("cpuset memory\n")
+
+        CgroupManager(root=root).setup()
+
+        assert "NO NUMA ISOLATION" not in caplog.text
 
     def test_without_cgroup_v2_jobs_fall_back_to_affinity(self, tmp_path, monkeypatch):
         monkeypatch.setattr(cgroup_mod, "CGROUP_FS", tmp_path)  # no cgroup.controllers

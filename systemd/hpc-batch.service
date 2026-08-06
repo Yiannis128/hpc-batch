@@ -19,14 +19,18 @@ ExecStart=/usr/local/bin/hpc-batchd --max-lifetime 24h --admin-group wheel
 ExecReload=/bin/kill -HUP $MAINPID
 
 # Jobs live in /sys/fs/cgroup/hpc-batch, which the daemon creates and owns,
-# NOT under this unit. Delegate= here would nest them in the service cgroup,
-# and surviving jobs would then make it impossible to restart: cgroup v2
-# refuses to hold a process in a cgroup whose children have controllers
-# enabled, so systemd would fail every start with 219/CGROUP until the last
-# job exited. Keeping the service cgroup a leaf is what makes it restartable.
+# NOT under this unit. Nothing is ever created inside the service cgroup, so
+# it stays a leaf: systemd can always remove and recreate it, even while jobs
+# from the previous daemon are still running.
 #
-# Covers the daemon only, for the same reason. Jobs get memory.swap.max=0
-# written into their own cgroup: swapping would wreck benchmark timings.
+# Delegate= is here only because it is what makes systemd enable cpuset and
+# memory at the cgroup root, which is where our tree inherits them from.
+# Without it the daemon silently drops to affinity-only pinning and loses
+# NUMA isolation entirely. Deleting this line looks right and is not.
+Delegate=cpuset memory pids
+
+# The daemon only. Jobs get memory.swap.max=0 written into their own cgroup:
+# swapping would wreck benchmark timings.
 MemorySwapMax=0
 # Only kill the daemon itself on stop/restart; jobs keep running and are
 # re-adopted when the daemon comes back.

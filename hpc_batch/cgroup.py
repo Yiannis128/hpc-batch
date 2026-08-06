@@ -56,10 +56,7 @@ class CgroupManager:
             available = set((self.root / "cgroup.controllers").read_text().split())
             for ctrl in _WANTED_CONTROLLERS:
                 if ctrl not in available:
-                    log.warning(
-                        "cgroup controller %r not enabled for %s; the kernel "
-                        "root must delegate it", ctrl, self.root,
-                    )
+                    log.warning("cgroup controller %r not enabled for %s", ctrl, self.root)
                     continue
                 try:
                     (self.root / "cgroup.subtree_control").write_text(f"+{ctrl}")
@@ -74,6 +71,18 @@ class CgroupManager:
             "cgroup subtree %s ready (controllers: %s)",
             self.root, ", ".join(sorted(self.controllers)) or "none",
         )
+        # Said plainly because the daemon keeps working without it: jobs still
+        # run, still get their cpus, and nothing looks wrong. What is gone is
+        # the guarantee that memory stays on the node those cpus are on, which
+        # is the reason this tool exists. Almost always Delegate= missing from
+        # the unit, which is what makes systemd enable cpuset at the root.
+        if "cpuset" not in self.controllers:
+            log.warning(
+                "NO NUMA ISOLATION: the cpuset controller is not available in "
+                "%s, so jobs fall back to cpu-affinity pinning and their memory "
+                "is not confined to a node. Check that the unit still has "
+                "'Delegate=cpuset memory pids'.", self.root,
+            )
         return True
 
     def create(
