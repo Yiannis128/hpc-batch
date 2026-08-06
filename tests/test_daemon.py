@@ -1,9 +1,10 @@
 import os
+import pwd
 from pathlib import Path
 
-from hpc_batch.daemon import Config, Daemon, run_as_user
+from hpc_batch.daemon import MAX_ENV_BYTES, Config, Daemon, _validate_env, run_as_user
 from hpc_batch.jobs import DONE, RUNNING, Job
-from hpc_batch.resources import ResourcePool
+from hpc_batch.resources import Allocation, ResourcePool
 
 
 def make_config(tmp_path: Path, **kw) -> Config:
@@ -235,6 +236,92 @@ def pooled_daemon(tmp_path, **kw) -> Daemon:
         node_mem_gb={0: 32.0, 1: 32.0},
     )
     return daemon
+
+
+class TestJobEnvironment:
+    """--env hands the job the submitter's own environment; without it the
+    job gets a clean one. Either way the daemon's own variables win."""
+
+    def env_for(self, daemon: Daemon, job: Job, gpus=(), gpu_ids=()) -> dict:
+        daemon.pool = ResourcePool(
+            node_cpus={0: [0, 1]}, gpu_ids=list(gpu_ids), node_mem_gb={0: 8.0}
+        )
+        alloc = Allocation(
+            cpus=[0], numa_nodes=[0], gpus=list(gpus), mem_gb=1.0,
+            mem_by_node={0: 1.0}, exclusive=False,
+        )
+        return daemon._job_env(job, pwd.getpwuid(os.getuid()), alloc)
+
+    def test_a_clean_environment_by_default(self, tmp_path):
+        daemon = make_daemon(tmp_path)
+        env = self.env_for(daemon, add_job(daemon, 1))
+        assert env["PATH"] == "/usr/local/bin:/usr/bin:/bin"
+        assert "SECCOM_A2_BATCH_SIZE" not in env
+
+    def test_forwards_what_the_submitter_sent(self, tmp_path):
+        daemon = make_daemon(tmp_path)
+        job = add_job(daemon, 1)
+        job.env = {"SECCOM_A2_BATCH_SIZE": "3", "PATH": "/data/venv/bin"}
+
+        env = self.env_for(daemon, job)
+
+        assert env["SECCOM_A2_BATCH_SIZE"] == "3"
+        assert env["PATH"] == "/data/venv/bin"  # theirs beats the default
+
+    def test_a_forwarded_cuda_visible_devices_cannot_widen_the_allocation(self, tmp_path):
+        # This is the whole of a job's gpu isolation. If a variable carried
+        # over from the submitting shell won, any user could reach every card
+        # on the machine by exporting it before submitting.
+        daemon = make_daemon(tmp_path)
+        job = add_job(daemon, 1)
+        job.env = {"CUDA_VISIBLE_DEVICES": "0,1,2,3"}
+
+        env = self.env_for(daemon, job, gpus=[2], gpu_ids=[0, 1, 2, 3])
+
+        assert env["CUDA_VISIBLE_DEVICES"] == "2"
+
+    def test_identity_and_job_id_are_not_overridable(self, tmp_path):
+        daemon = make_daemon(tmp_path)
+        job = add_job(daemon, 7)
+        job.env = {"HOME": "/root", "USER": "root", "HPC_BATCH_JOB_ID": "999"}
+
+        env = self.env_for(daemon, job)
+
+        pw = pwd.getpwuid(os.getuid())
+        assert env["HOME"] == pw.pw_dir
+        assert env["USER"] == pw.pw_name
+        assert env["HPC_BATCH_JOB_ID"] == "7"
+
+
+class TestValidateEnv:
+    def test_accepts_a_string_mapping(self):
+        assert _validate_env({"A": "1"}) == ({"A": "1"}, None)
+
+    def test_absent_means_clean(self):
+        assert _validate_env(None) == ({}, None)
+
+    def test_rejects_non_string_values(self):
+        # json.dumps would happily send numbers or nested objects, and execve
+        # would reject them much later, when the job is already queued.
+        env, problem = _validate_env({"A": 1})
+        assert env == {}
+        assert problem is not None
+
+    def test_rejects_an_oversized_environment(self):
+        env, problem = _validate_env({"BIG": "x" * (MAX_ENV_BYTES + 1)})
+        assert env == {}
+        assert "too large" in problem
+
+
+class TestStateFilePermissions:
+    def test_state_file_is_root_only(self, tmp_path):
+        # It holds every user's jobs, and with --env their secrets too.
+        daemon = make_daemon(tmp_path)
+        add_job(daemon, 1)
+
+        daemon._persist(force=True)
+
+        assert daemon.state_file.stat().st_mode & 0o777 == 0o600
 
 
 class TestDefaultMemoryBudget:

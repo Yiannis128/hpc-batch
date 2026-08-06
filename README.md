@@ -57,7 +57,14 @@ and benchmark timings are stable.
   nothing is lost, and the error is reported by `dispatch list --finished`.
 - **Authentication**: the daemon identifies clients by `SO_PEERCRED` on the
   unix socket, so users cannot impersonate each other. Jobs are executed
-  under the submitting user's uid/gid with a clean environment.
+  under the submitting user's uid/gid.
+- **Environment**: a job gets a clean environment (`PATH`, `HOME`, `USER`,
+  `SHELL`, `LANG`) unless you pass `--env`, which forwards the one you
+  submitted from. `HPC_BATCH_JOB_ID` and `CUDA_VISIBLE_DEVICES` are always
+  set by the daemon and a forwarded value never wins: the latter is how a
+  job is held to the gpus it was allocated. A forwarded environment is
+  stored with the job so a queued one survives a daemon restart, which is
+  why the state file is root-only.
 - **Hot reload**: `systemctl reload hpc-batch` makes the daemon persist its
   state and re-exec itself in place. Running jobs are *not* killed; they are
   re-adopted by the new daemon (pid-reuse is guarded by comparing
@@ -196,6 +203,11 @@ dispatch new --cpu 2 --gpu-cores 3 --max-mem 84 --max-time 2h -- ./run_benchmark
 dispatch new --output ~/results -- ./run_benchmark.sh      # ~/results/output.<id>.log
 dispatch new --output ~/results/run1.log -- ./run_benchmark.sh
 dispatch new --no-output -- ./noisy_job.sh
+
+# Pass your current environment through instead of getting a clean one.
+# Drop anything you would rather not send in the same breath:
+dispatch new --env -- ./run_benchmark.sh
+HF_TOKEN= dispatch new --env -- ./run_benchmark.sh
 
 # Run alone on the machine (waits until idle, blocks others while running).
 # Without --cpu this takes every core and all the memory:
