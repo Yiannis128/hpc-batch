@@ -2,7 +2,17 @@ import os
 import pwd
 from pathlib import Path
 
-from hpc_batch.daemon import MAX_ENV_BYTES, Config, Daemon, _env_problem, run_as_user
+import pytest
+
+from hpc_batch import daemon as daemon_mod
+from hpc_batch.daemon import (
+    MAX_ENV_BYTES,
+    Config,
+    Daemon,
+    StartupError,
+    _env_problem,
+    run_as_user,
+)
 from hpc_batch.jobs import DONE, QUEUED, RUNNING, Job
 from hpc_batch.resources import ResourcePool
 from test_resources import held
@@ -17,6 +27,7 @@ def make_config(tmp_path: Path, **kw) -> Config:
         state_dir=tmp_path / "state",
         dev_dir=tmp_path / "dev",
         use_cgroups=False,
+        use_dev_dir=False,
         schedule="fifo-strict",
         keep_finished=50,
         reserve_cpu=2,
@@ -112,6 +123,47 @@ class TestOutputDestination:
         )
         assert dest is None
         assert err is not None
+
+
+class TestStartupRefusals:
+    """Isolation that was asked for and cannot be delivered stops the daemon.
+    A warning gets read once, at install time, by someone who is not looking
+    for it; the promise then quietly does not hold for months."""
+
+    def test_a_missing_admin_group_is_fatal(self, tmp_path):
+        daemon = make_daemon(tmp_path, admin_group="no-such-group-here")
+
+        with pytest.raises(StartupError) as caught:
+            daemon._resolve_admin_gid()
+        assert "no-such-group-here" in str(caught.value)
+
+    def test_it_names_a_group_that_does_exist(self, tmp_path, monkeypatch):
+        # The usual cause is `wheel` on a Debian box, where the answer is
+        # `sudo`. Saying which groups exist turns a puzzle into a one-word fix.
+        monkeypatch.setattr(daemon_mod, "group_exists", lambda g: g == "sudo")
+        daemon = make_daemon(tmp_path, admin_group="wheel-but-not-on-this-box")
+
+        with pytest.raises(StartupError) as caught:
+            daemon._resolve_admin_gid()
+        assert "sudo" in str(caught.value)
+
+    def test_an_unusable_dev_dir_is_fatal(self, tmp_path):
+        blocked = tmp_path / "not-a-dir"
+        blocked.write_text("")
+        daemon = make_daemon(tmp_path, dev_dir=blocked, use_dev_dir=True)
+
+        with pytest.raises(StartupError) as caught:
+            daemon._setup_dirs()
+        assert "--no-dev-dir" in str(caught.value)  # refusals name their opt-out
+
+    def test_no_dev_dir_is_the_way_to_ask_for_it(self, tmp_path):
+        blocked = tmp_path / "not-a-dir"
+        blocked.write_text("")
+        daemon = make_daemon(tmp_path, dev_dir=blocked, use_dev_dir=False)
+
+        daemon._setup_dirs()  # does not raise
+
+        assert daemon._dev_ok is False
 
 
 class TestRetention:

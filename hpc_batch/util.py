@@ -1,11 +1,26 @@
-"""Small shared helpers: duration parsing/formatting and table rendering."""
+"""Small shared helpers: duration parsing/formatting, table rendering, and
+the admin-group lookup the daemon and the installer have to agree on."""
 
 import argparse
+import grp
 import re
 import time
 
 _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 _DURATION_RE = re.compile(r"(\d+)([smhd])")
+
+# Distro-dependent, and getting it wrong means nobody but root is an admin.
+# The installer picks the first that exists; the daemon suggests them when
+# --admin-group names one that does not. Two lists would let those disagree.
+ADMIN_GROUPS = ("wheel", "sudo", "adm", "staff")
+
+
+def group_exists(name: str) -> bool:
+    try:
+        grp.getgrnam(name)
+    except KeyError:
+        return False
+    return True
 
 
 def parse_duration(text: str) -> int:

@@ -1,0 +1,85 @@
+name: Release
+
+# Publishing a GitHub release is the trigger. Tagging alone does nothing, so
+# a tag pushed by mistake costs nothing and there is one deliberate action
+# that starts a release. See "Releasing" in README.md.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: The tag must match the version in the package
+        # PyPI takes the version from the metadata and GitHub takes it from
+        # the tag. Nothing downstream compares them, so without this you can
+        # ship v0.2.0 containing 0.1.0 and only find out from a bug report.
+        run: |
+          python - <<'PY'
+          import os, re, sys, pathlib
+          tag = os.environ["TAG"]
+          src = pathlib.Path("hpc_batch/__init__.py").read_text()
+          version = re.search(r'__version__ = "([^"]+)"', src).group(1)
+          if tag.lstrip("v") != version:
+              sys.exit(f"tag {tag} does not match __version__ {version}")
+          print(f"tag {tag} matches __version__ {version}")
+          PY
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+
+      # Build first and test what is about to be published, rather than
+      # letting `pip install .` build a second wheel that is then discarded.
+      - run: pip install hatch
+      - run: hatch build
+      - run: pip install dist/*.whl pytest
+      - name: Tests must pass before anything is published
+        run: python -m pytest tests -q
+
+      - name: The wheel must carry the systemd unit
+        run: python scripts/check_wheel.py
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  github-release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # attaching files to the release
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+      - run: gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          GH_TOKEN: ${{ github.token }}
+
+  pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    # Trusted publishing: PyPI verifies a short-lived OIDC token naming this
+    # repository, workflow and environment. There is no API token to store,
+    # leak or rotate. The environment name must match the one registered with
+    # PyPI exactly.
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@v1.14.2

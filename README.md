@@ -1,5 +1,7 @@
 # hpc-batch
 
+[![CI](https://github.com/Yiannis128/hpc-batch/actions/workflows/ci.yml/badge.svg)](https://github.com/Yiannis128/hpc-batch/actions/workflows/ci.yml)
+
 A single-node batch job system for shared HPC/benchmark machines. A root
 daemon (`hpc-batchd`, run from systemd) accepts job submissions from users
 via the `dispatch` CLI, queues them FIFO, and runs each one in its own
@@ -16,8 +18,9 @@ and benchmark timings are stable.
   node as the allocated CPUs) and `memory.max` applied. That tree is
   deliberately not the daemon's service cgroup, so restarting the unit never
   disturbs a running job; the unit still needs `Delegate=cpuset memory pids`
-  so those controllers exist at the cgroup root. Swap is disabled for
-  every job (`memory.swap.max=0`):
+  so those controllers exist at the cgroup root, and without it the daemon
+  refuses to start rather than run without NUMA isolation. Swap is disabled
+  for every job (`memory.swap.max=0`):
   `--max-mem` is a hard RAM budget, and a job that exceeds it is
   OOM-killed as a whole group instead of thrashing in swap.
 - **Every job has a memory budget, whether or not it asks for one.** An
@@ -33,10 +36,10 @@ and benchmark timings are stable.
   go into `cpuset.mems`, so the job can never allocate where nobody
   budgeted for it. Access to the remote part is slower, so `dispatch list`
   marks those jobs with `+` and `--numa-local` refuses to spread at all,
-  waiting for a node that fits the whole budget. When the cpuset controller
-  is unavailable (undelegated, or `--no-cgroups`) a job really can allocate
-  anywhere, and the daemon tracks one machine-wide pool instead; the
-  startup log line says which mode is in force.
+  waiting for a node that fits the whole budget. Under `--no-cgroups` a job
+  really can allocate anywhere, and the daemon tracks one machine-wide pool
+  instead; the startup log line says which mode is in force. Without that
+  flag an unavailable cpuset controller is a refusal, not a downgrade.
 - **GPUs**: `--gpu-cores N` allocates N of the GPUs enumerated by
   `nvidia-smi -L`; the job sees them via `CUDA_VISIBLE_DEVICES` (jobs that
   requested no GPUs get an empty `CUDA_VISIBLE_DEVICES`).
@@ -76,61 +79,76 @@ and benchmark timings are stable.
 
 ## Install
 
-Needs Python >= 3.10, cgroups v2, and root (systemd) for the daemon. The
-whole sequence, copy/paste:
+Needs Python >= 3.10, systemd, cgroups v2, and root for the daemon.
 
 ```sh
-# 1. Source, and build a wheel as a normal user (not root, so no
-#    root-owned build artifacts end up in the checkout).
-git clone https://github.com/Yiannis128/hpc-batch.git ~/projects/hpc-batch
-cd ~/projects/hpc-batch
-rm -rf dist
-python3 -m venv /tmp/hb-build
-/tmp/hb-build/bin/pip wheel -q --no-deps -w dist .
+curl -fsSL https://raw.githubusercontent.com/Yiannis128/hpc-batch/master/install.sh | sudo sh
+```
 
-# 2. Install into a dedicated venv and expose both entry points.
-sudo python3 -m venv /opt/hpc-batch
-sudo /opt/hpc-batch/bin/pip install -q dist/hpc_batch-*.whl
-sudo ln -sf /opt/hpc-batch/bin/dispatch   /usr/local/bin/dispatch
-sudo ln -sf /opt/hpc-batch/bin/hpc-batchd /usr/local/bin/hpc-batchd
+That creates a virtualenv at `/opt/hpc-batch`, installs `hpc-batch` from
+PyPI into it, links `dispatch`, `hpc-batchd` and `hpc-batch-install` into
+`/opt/bin`, adds `/opt/bin` to everyone's `PATH` via
+`/etc/profile.d/hpc-batch.sh`, writes the systemd unit with an admin group
+that exists on this distro (`wheel`, `sudo`, `adm`, whichever it finds
+first), and starts the daemon.
 
-# 3. Install the unit. --admin-group must name a group that exists:
-#    "sudo" on Debian/Ubuntu, "wheel" on Fedora/RHEL (the shipped default).
-sudo cp systemd/hpc-batch.service /etc/systemd/system/
-sudo sed -i 's/--admin-group wheel/--admin-group sudo/' /etc/systemd/system/hpc-batch.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now hpc-batch
+`PATH` only changes for *new* login shells, so in the one you ran it from
+use `/opt/bin/dispatch` or log in again. Then:
 
-# 4. Verify.
+```sh
 systemctl status hpc-batch --no-pager
 dispatch new -- echo hello
 dispatch list --finished
 ```
 
-`/opt/hpc-batch` is world-readable, so every user on the machine can run
-`dispatch`. Do **not** install with `sudo pipx`: it puts the entry points in
+If you would rather not pipe a script into a shell, the same thing in two
+steps:
+
+```sh
+sudo python3 -m venv /opt/hpc-batch
+sudo /opt/hpc-batch/bin/pip install hpc-batch
+sudo /opt/hpc-batch/bin/hpc-batch-install
+```
+
+`hpc-batch-install --help` covers the rest: `--prefix`, `--bin-dir`,
+`--admin-group`, `--spec` (install a specific version, or a checkout), and
+`--uninstall`, which removes everything except `/var/lib/hpc-batch` so job
+history and queued jobs survive.
+
+Do **not** install with `sudo pipx`: it puts the entry points in
 `/root/.local/bin` (mode 700), where `hpc-batchd` still works but no other
 user can run the client.
-
-Adjust the admin parameters on the `ExecStart=` line to taste (see
-[Admin configuration](#admin-configuration)); they are all daemon arguments.
 
 ## Update
 
 ```sh
-cd ~/projects/hpc-batch
-git pull
-rm -rf dist
-python3 -m venv /tmp/hb-build
-/tmp/hb-build/bin/pip wheel -q --no-deps -w dist .
-sudo /opt/hpc-batch/bin/pip install -q --force-reinstall --no-deps dist/hpc_batch-*.whl
-sudo systemctl reload hpc-batch
+sudo /opt/bin/hpc-batch-install
 ```
 
-Use `reload`, not `restart`: reload makes the daemon persist its state and
-re-exec in place, so running jobs are re-adopted instead of killed. If the
-unit file itself changed, `sudo cp` it again and `systemctl daemon-reload`
-before reloading (re-applying the `--admin-group` edit from step 3).
+Reinstalls from PyPI and *reloads* the daemon rather than restarting it, so
+running jobs are re-adopted instead of losing their exit codes. The unit is
+rewritten each time, so keep local changes in a drop-in (`systemctl edit
+hpc-batch`) rather than editing the file in place.
+
+## Refusals
+
+The daemon does not start half-configured. If it was asked for isolation it
+cannot deliver, it says which piece is missing and exits 78 (`EX_CONFIG`),
+which the unit's `RestartPreventExitStatus=` turns into a clean stop rather
+than a restart loop over the error message:
+
+- cgroups v2 not mounted, or the daemon is not root
+- the `cpuset` or `memory` controller is not available in its cgroup, which
+  almost always means `Delegate=` was removed from the unit
+- `--admin-group` names a group that does not exist here (it suggests ones
+  that do)
+- `--dev-dir` cannot be created
+
+Each refusal names the flag that opts out of the thing it is refusing over
+(`--no-cgroups`, `--no-dev-dir`), for the cases where you genuinely want to
+run without it. `--no-cgroups` in particular means cpu-affinity pinning
+only, with no enforced memory limit and no NUMA confinement: fine for
+development on a laptop, not for a shared machine.
 
 ## Admin configuration
 
@@ -145,12 +163,13 @@ systemd unit's `ExecStart=` line:
 | `--min-job-mem GB` | `2` | Floor for an automatically assigned budget, so a single-core job on a core-dense machine is not left with a sliver. Ignored when the user passes `--max-mem`. |
 | `--keep-finished N` | `50` | Finished jobs remembered **per user** for `dispatch list --finished`. Metadata only; output is never kept here. |
 | `--list-is-public` | off | Allow non-admins to use `dispatch list --all`. |
-| `--admin-group GROUP` | `wheel` | Members can list, attach to and kill any user's jobs. |
+| `--admin-group GROUP` | `wheel` | Members can list, attach to and kill any user's jobs. The daemon refuses to start if the group does not exist; `hpc-batch-install` fills in one that does. |
 | `--socket PATH` | `/run/hpc-batch/hpc-batch.sock` | Unix socket the daemon listens on. |
 | `--state-dir DIR` | `/var/lib/hpc-batch` | Job state, metadata and output. |
 | `--dev-dir DIR` | `/dev/hpc-batch` | Where job inspection entries appear. |
 | `--schedule POLICY` | `fifo-strict` | Scheduling policy (see below). |
-| `--no-cgroups` | off | Development mode: skip cgroups, pin CPUs with `sched_setaffinity` only. |
+| `--no-cgroups` | off | Development mode: skip cgroups, pin CPUs with `sched_setaffinity` only, and enforce no memory limit. Without it, unavailable cgroups are a refusal to start. |
+| `--no-dev-dir` | off | Skip the per-job inspection entries under `--dev-dir` instead of refusing to start when they cannot be created. |
 
 Durations accept plain seconds or `s`/`m`/`h`/`d` suffixes, e.g. `45m`,
 `2h`, `1h30m`.
@@ -250,6 +269,56 @@ to a finished job just tells you where that file is.
 The socket path for the client can be overridden with `$HPC_BATCH_SOCKET`
 (useful with a non-default `--socket`).
 
+## Releasing
+
+Publishing a GitHub release is what triggers a release; pushing a tag on its
+own does nothing, so a mistagged commit costs nothing.
+
+```sh
+# 1. Bump the version. It lives in exactly one place.
+vim hpc_batch/__init__.py          # __version__ = "0.2.0"
+git commit -am "Release 0.2.0" && git push
+
+# 2. Tag and publish. `gh release create` does both.
+gh release create v0.2.0 --generate-notes
+```
+
+The workflow then checks the tag matches `__version__`, runs the tests,
+builds the sdist and wheel, attaches them to the GitHub release, and
+publishes to PyPI. A tag that disagrees with the package version fails
+before anything is published: PyPI reads the version from the metadata and
+GitHub reads it from the tag, and nothing else compares them.
+
+### One-time PyPI setup
+
+The workflow authenticates with [trusted
+publishing](https://docs.pypi.org/trusted-publishers/), so there is no API
+token to store, leak or rotate. PyPI verifies a short-lived OIDC token that
+GitHub mints for this repository, and only for the workflow named below.
+
+Before the first release, at
+<https://pypi.org/manage/account/publishing/>, add a *pending* publisher
+(the project need not exist yet) with exactly these values:
+
+| Field | Value |
+| --- | --- |
+| PyPI project name | `hpc-batch` |
+| Owner | `Yiannis128` |
+| Repository name | `hpc-batch` |
+| Workflow name | `release.yml` |
+| Environment name | `pypi` |
+
+The environment name has to match `environment: pypi` in
+`.github/workflows/release.yml`. GitHub creates that environment on first
+use; adding required reviewers to it under Settings → Environments turns
+publishing into something that needs an explicit approval.
+
+No repository secrets are involved. If you would rather use an API token
+anyway, put it in a `PYPI_API_TOKEN` secret and give the publish step
+`with: password: ${{ secrets.PYPI_API_TOKEN }}` — but then it is a
+long-lived credential with upload rights, which is the thing trusted
+publishing exists to avoid.
+
 ## Development
 
 No root required: run the daemon in user mode against scratch paths.
@@ -267,4 +336,9 @@ dispatch list
 ```
 
 In user mode the daemon only accepts jobs from its own uid (it cannot
-setuid) and falls back from cgroups to CPU affinity pinning.
+setuid), and `--no-cgroups` is required: without it the daemon refuses to
+start rather than run a shared machine's worth of jobs unisolated.
+
+CI runs the suite on Python 3.10 through 3.13, builds both artefacts, and
+checks that the wheel still carries the systemd unit and that the installed
+entry points refuse a non-root run.
