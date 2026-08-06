@@ -25,9 +25,11 @@ When we cannot set `cpuset.mems` at all (no cpuset controller, or
 machine-wide domain instead of pretending otherwise.
 
 GPUs follow the same principle. A multi-GPU job's devices talk to each
-other, so the pool hands out the closest-connected free set that
-`nvidia-smi topo -m` describes rather than the lowest free indices, and puts
-the job's cpus on the NUMA node those GPUs hang off.
+other, and taking the lowest free indices hands it a pair on opposite sides
+of the machine whenever the index between them is busy. So the pool hands
+out the closest-connected free set that `nvidia-smi topo -m` describes, and
+puts the job's cpus on the NUMA node those GPUs hang off. Where that file
+tells us nothing, GPU choice is index order, as it was before.
 """
 
 import copy
@@ -39,6 +41,7 @@ import re
 import subprocess
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -166,24 +169,28 @@ def apply_reserve(
     return cpus, mem
 
 
-def discover_gpus() -> list[int]:
-    """GPU indices reported by `nvidia-smi -L`; empty when unavailable."""
+def _nvidia_smi(*args: str) -> str:
+    """Output of an `nvidia-smi` query, or "" if it cannot be asked."""
     try:
         out = subprocess.run(
-            ["nvidia-smi", "-L"], capture_output=True, text=True, timeout=15
+            ["nvidia-smi", *args], capture_output=True, text=True, timeout=15
         )
     except (OSError, subprocess.TimeoutExpired):
-        return []
-    if out.returncode != 0:
-        return []
+        return ""
+    return out.stdout if out.returncode == 0 else ""
+
+
+def discover_gpus() -> list[int]:
+    """GPU indices reported by `nvidia-smi -L`; empty when unavailable."""
     gpus = []
-    for line in out.stdout.splitlines():
+    for line in _nvidia_smi("-L").splitlines():
         match = _GPU_LINE.match(line.strip())
         if match:
             gpus.append(int(match.group(1)))
     return gpus
 
 
+@lru_cache(maxsize=None)
 def _link_rank(label: str | None) -> int:
     """How far apart a link class puts two GPUs, closest = 0.
 
@@ -196,6 +203,7 @@ def _link_rank(label: str | None) -> int:
     return _LINK_CLASSES.index(label) if label in _LINK_CLASSES else len(_LINK_CLASSES)
 
 
+@lru_cache(maxsize=None)
 def _nvlink_width(label: str | None) -> int:
     """Number of bonded NVLinks a label describes; 0 if it is not NVLink."""
     match = _NVLINK.match(label or "")
@@ -204,12 +212,11 @@ def _nvlink_width(label: str | None) -> int:
 
 @dataclass(frozen=True)
 class GpuTopology:
-    """How the GPUs are wired: the link class between each pair, and the NUMA
-    node each one hangs off.
+    """The link class between each pair of GPUs, and the NUMA node each one
+    hangs off.
 
-    Empty when `nvidia-smi topo -m` is unavailable or unreadable. Every
-    method then answers "no idea" and GPU choice degrades to index order,
-    which is what it was before any of this existed.
+    Empty when `nvidia-smi topo -m` is unavailable or unreadable; every
+    method then answers "no idea".
     """
 
     links: dict[tuple[int, int], str] = field(default_factory=dict)
@@ -218,8 +225,16 @@ class GpuTopology:
     def __bool__(self) -> bool:
         return bool(self.links or self.numa_node)
 
+    def __deepcopy__(self, memo) -> "GpuTopology":
+        # Shared, not copied: the machine's wiring cannot change under us,
+        # and ResourcePool.clone() deep-copies the pool on every tick.
+        return self
+
     def link(self, a: int, b: int) -> str | None:
         return self.links.get((min(a, b), max(a, b)))
+
+    def _pairs(self, gpus: Iterable[int]) -> list[str | None]:
+        return [self.link(a, b) for a, b in itertools.combinations(sorted(gpus), 2)]
 
     def _score(self, links: list[str | None]) -> tuple[int, int, int]:
         """Worst link, total distance, then NVLink width (more is better)."""
@@ -239,18 +254,16 @@ class GpuTopology:
         equally good sets always resolve the same way.
         """
         ids = sorted(gpus)
-        pairs = [self.link(a, b) for a, b in itertools.combinations(ids, 2)]
-        return (*self._score(pairs), ids)
+        return (*self._score(self._pairs(ids)), ids)
 
     def attach_rank(self, chosen: Iterable[int], gpu: int) -> tuple:
         """Sort key over GPUs to add to ``chosen``: only the new links."""
         return (*self._score([self.link(gpu, c) for c in chosen]), gpu)
 
     def worst_link(self, gpus: Iterable[int]) -> str | None:
-        """The link class pacing this set, for reporting. None when the set
-        has no pair, or none we know anything about."""
-        pairs = [self.link(a, b) for a, b in itertools.combinations(sorted(gpus), 2)]
-        return max((p for p in pairs if p), key=_link_rank, default=None)
+        """The link class pacing this set. None when it has no pair, or none
+        we know anything about."""
+        return max((p for p in self._pairs(gpus) if p), key=_link_rank, default=None)
 
     def nodes_for(self, gpus: Iterable[int]) -> set[int]:
         """The NUMA nodes these GPUs hang off; empty when unknown."""
@@ -299,15 +312,7 @@ def parse_gpu_topology(text: str) -> GpuTopology:
 
 def discover_gpu_topology() -> GpuTopology:
     """GPU interconnect per `nvidia-smi topo -m`; empty when unavailable."""
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "topo", "-m"], capture_output=True, text=True, timeout=15
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return GpuTopology()
-    if out.returncode != 0:
-        return GpuTopology()
-    return parse_gpu_topology(out.stdout)
+    return parse_gpu_topology(_nvidia_smi("topo", "-m"))
 
 
 def total_memory_gb() -> float:
@@ -515,9 +520,12 @@ class ResourcePool:
         return len(self.node_cpus) if req.exclusive and not req.numa_local else 1
 
     def _cpu_node_order(
-        self, req: Request, only: int | None, max_nodes: int, gpus: Iterable[int] = ()
+        self, req: Request, only: int | None, max_nodes: int, near: set[int]
     ) -> list[int]:
-        """The nodes to draw cpus from, best first. Empty means no placement."""
+        """The nodes to draw cpus from, best first. Empty means no placement.
+
+        ``near`` are the nodes this job's devices already sit on, if any.
+        """
         candidates = [n for n in self.free_cpus if only is None or n == only]
         if max_nodes > 1:
             # Spanning the machine: there is no one else to keep a node free
@@ -527,26 +535,26 @@ class ResourcePool:
         whole = [n for n in candidates if len(self.free_cpus[n]) >= req.cpu]
         local = [n for n in whole if self._fits_locally(n, req.mem_gb)]
         if local:
-            # The node this job's own gpus hang off leads: everything it feeds
+            # A node the job's own devices sit on leads: everything it feeds
             # them crosses the interconnect otherwise. Then best fit — fewest
             # free cpus, then least free memory — which keeps roomier nodes
             # available for bigger jobs. Node id breaks ties so placement stays
             # deterministic.
-            near = self.gpu_topology.nodes_for(gpus)
             return sorted(
                 local,
                 key=lambda n: (n not in near, len(self.free_cpus[n]), self._free_mem(n), n),
             )
         if req.numa_local:
             return []
-        # The budget has to span nodes. Here memory leads and cpu best-fit
-        # only breaks ties: this job is already going to pay for remote
-        # access, so the node with the most free memory keeps that bill as
-        # small as possible. Whether it fits at all is _charge_plan's call.
+        # The budget has to span nodes. Here memory leads, ahead of even
+        # ``near``: this job is already going to pay for remote access, so the
+        # node with the most free memory keeps that bill as small as possible,
+        # and cpu best-fit only breaks ties. Whether it fits at all is
+        # _charge_plan's call.
         return sorted(whole, key=lambda n: (-self._free_mem(n), len(self.free_cpus[n]), n))
 
     def _pick_cpus(
-        self, req: Request, only: int | None, max_nodes: int, gpus: Iterable[int] = ()
+        self, req: Request, only: int | None, max_nodes: int, near: set[int]
     ) -> tuple[list[int], list[int]] | None:
         """Choose this request's cpus: which nodes, and which cores on them.
 
@@ -554,12 +562,11 @@ class ResourcePool:
         is satisfied, using at most ``max_nodes`` of them. At ``max_nodes==1``
         this is the ordinary "one node holds the whole job" case; a larger
         ceiling is what lets an exclusive job take the machine. One mechanism
-        either way, so the ``only`` pin and the memory- and gpu-aware node
-        ranking apply uniformly.
+        either way, so the ``only`` pin and the node ranking apply uniformly.
         """
         cpus: list[int] = []
         nodes: list[int] = []
-        for node in self._cpu_node_order(req, only, max_nodes, gpus):
+        for node in self._cpu_node_order(req, only, max_nodes, near):
             if len(cpus) >= req.cpu or len(nodes) >= max_nodes:
                 break
             take = sorted(self.free_cpus[node])[: req.cpu - len(cpus)]
@@ -568,16 +575,13 @@ class ResourcePool:
                 nodes.append(node)
         return (cpus, nodes) if len(cpus) == req.cpu else None
 
-    def _pick_gpus(self, count: int) -> list[int]:
-        """The closest-connected set of ``count`` free GPUs.
-
-        Which GPUs a job gets is not arbitrary once it has more than one:
-        taking the lowest free indices hands a 2-GPU job a pair on opposite
-        sides of the machine whenever the index between them happens to be
-        busy. With no topology this is index order, exactly as before.
+    def _pick_gpus(self, count: int, *, search: bool = True) -> list[int]:
+        """``count`` free GPUs: the closest-connected set, or the lowest free
+        indices when there is no topology to consult, when the free GPUs are
+        exactly used up either way, or when ``search`` is off.
         """
         free = sorted(self.free_gpus)
-        if count <= 0 or count >= len(free) or not self.gpu_topology:
+        if not search or count <= 0 or count >= len(free) or not self.gpu_topology:
             return free[:count]
         if math.comb(len(free), count) * math.comb(count, 2) <= _MAX_GPU_LINK_SCANS:
             return list(min(itertools.combinations(free, count), key=self.gpu_topology.rank))
@@ -640,11 +644,9 @@ class ResourcePool:
             return None
         # GPUs first: they are the fixed points here — a job cannot be moved
         # to the other end of the machine, but its cpus can be placed near it.
-        gpus = (
-            self._pick_gpus(req.gpu_cores) if place_gpus
-            else sorted(self.free_gpus)[: req.gpu_cores]
-        )
-        picked = self._pick_cpus(req, node, self._max_nodes(req), gpus)
+        gpus = self._pick_gpus(req.gpu_cores, search=place_gpus)
+        near = self.gpu_topology.nodes_for(gpus)
+        picked = self._pick_cpus(req, node, self._max_nodes(req), near)
         if picked is None:
             return None
         cpus, cpu_nodes = picked

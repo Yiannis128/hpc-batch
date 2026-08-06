@@ -700,9 +700,7 @@ class Daemon:
         )
 
     def _gpu_note(self, alloc: Allocation) -> str:
-        """The gpus a job got, and the link class pacing them: on a machine
-        where the free gpus were not adjacent, that is the difference between
-        a run being slow and being slow *for a reason you can see*."""
+        """The gpus a job got, and the link class pacing them when known."""
         if not alloc.gpus:
             return ""
         link = self.pool.gpu_topology.worst_link(alloc.gpus)

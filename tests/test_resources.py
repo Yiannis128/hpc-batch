@@ -41,12 +41,9 @@ def make_pool() -> ResourcePool:
 
 def topo_pool() -> ResourcePool:
     """`make_pool` on a machine whose GPU wiring we know: see TOPO_OUTPUT."""
-    return ResourcePool(
-        node_cpus={0: [0, 1, 2, 3], 1: [4, 5, 6, 7]},
-        gpu_ids=[0, 1, 2, 3],
-        node_mem_gb={0: 32.0, 1: 32.0},
-        gpu_topology=parse_gpu_topology(TOPO_OUTPUT),
-    )
+    pool = make_pool()
+    pool.gpu_topology = parse_gpu_topology(TOPO_OUTPUT)
+    return pool
 
 
 def req(cpu=1, gpu=0, mem=None, exclusive=False, numa_local=False) -> Request:
