@@ -258,6 +258,56 @@ to a finished job just tells you where that file is.
 The socket path for the client can be overridden with `$HPC_BATCH_SOCKET`
 (useful with a non-default `--socket`).
 
+## Releasing
+
+Publishing a GitHub release is what triggers a release; pushing a tag on its
+own does nothing, so a mistagged commit costs nothing.
+
+```sh
+# 1. Bump the version. It lives in exactly one place.
+vim hpc_batch/__init__.py          # __version__ = "0.2.0"
+git commit -am "Release 0.2.0" && git push
+
+# 2. Tag and publish. `gh release create` does both.
+gh release create v0.2.0 --generate-notes
+```
+
+The workflow then checks the tag matches `__version__`, runs the tests,
+builds the sdist and wheel, attaches them to the GitHub release, and
+publishes to PyPI. A tag that disagrees with the package version fails
+before anything is published: PyPI reads the version from the metadata and
+GitHub reads it from the tag, and nothing else compares them.
+
+### One-time PyPI setup
+
+The workflow authenticates with [trusted
+publishing](https://docs.pypi.org/trusted-publishers/), so there is no API
+token to store, leak or rotate. PyPI verifies a short-lived OIDC token that
+GitHub mints for this repository, and only for the workflow named below.
+
+Before the first release, at
+<https://pypi.org/manage/account/publishing/>, add a *pending* publisher
+(the project need not exist yet) with exactly these values:
+
+| Field | Value |
+| --- | --- |
+| PyPI project name | `hpc-batch` |
+| Owner | `Yiannis128` |
+| Repository name | `hpc-batch` |
+| Workflow name | `release.yml` |
+| Environment name | `pypi` |
+
+The environment name has to match `environment: pypi` in
+`.github/workflows/release.yml`. GitHub creates that environment on first
+use; adding required reviewers to it under Settings → Environments turns
+publishing into something that needs an explicit approval.
+
+No repository secrets are involved. If you would rather use an API token
+anyway, put it in a `PYPI_API_TOKEN` secret and give the publish step
+`with: password: ${{ secrets.PYPI_API_TOKEN }}` — but then it is a
+long-lived credential with upload rights, which is the thing trusted
+publishing exists to avoid.
+
 ## Development
 
 No root required: run the daemon in user mode against scratch paths.
