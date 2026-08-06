@@ -75,6 +75,11 @@ _LINK_CLASSES = ("NV", "PIX", "PXB", "PHB", "NODE", "SYS")
 #: so demanding it would rule nothing out.
 GPU_LINK_CHOICES = _LINK_CLASSES[:-1]
 
+#: Classes where the GPUs have left their own PCIe tree, so a peer-to-peer
+#: copy between them is staged through host memory instead of going card to
+#: card. `dispatch list` marks these.
+REMOTE_GPU_LINKS = _LINK_CLASSES[_LINK_CLASSES.index("PHB"):]
+
 #: Links we will score to choose between the GPU sets one island offers. Past
 #: this the island is taken apart into the finer ones inside it instead, which
 #: is both cheaper and what the answer looks like anyway at that width. No
@@ -488,12 +493,12 @@ class ResourcePool:
     def total_cpus(self) -> int:
         return sum(len(cpus) for cpus in self.node_cpus.values())
 
-    def gpus_by_node(self) -> dict[int, list[int]]:
-        """The machine's GPUs grouped by the NUMA node they hang off. Empty
-        when the topology does not say, which is what makes --numa-local-gpu
-        unenforceable rather than merely unavailable."""
+    def gpus_by_node(self, gpus: Iterable[int] | None = None) -> dict[int, list[int]]:
+        """GPUs grouped by the NUMA node they hang off, the whole machine's by
+        default. Empty when the topology does not say, which is what makes
+        --numa-local-gpu unenforceable rather than merely unavailable."""
         by_node: dict[int, list[int]] = {}
-        for gpu in self.gpu_ids:
+        for gpu in self.gpu_ids if gpus is None else gpus:
             node = self.gpu_topology.numa_node.get(gpu)
             if node is not None:
                 by_node.setdefault(node, []).append(gpu)
@@ -673,11 +678,7 @@ class ResourcePool:
         free = sorted(self.free_gpus)
         if not req.numa_local_gpu:
             return [free]
-        by_node: dict[int, list[int]] = {}
-        for gpu in free:
-            node = self.gpu_topology.numa_node.get(gpu)
-            if node is not None:
-                by_node.setdefault(node, []).append(gpu)
+        by_node = self.gpus_by_node(free)
         return [by_node[node] for node in sorted(by_node)]
 
     def _pick_gpus(self, req: Request, *, search: bool = True) -> list[int] | None:
@@ -685,14 +686,17 @@ class ResourcePool:
         satisfy it and the job has to wait.
 
         ``search`` off takes them in index order rather than looking for the
-        closest set: which GPUs a job gets never decides whether it fits, so a
-        caller only asking that question need not pay for the search.
+        closest set, for a caller only asking whether the request fits: which
+        GPUs a job gets does not normally decide that. ``min_gpu_link`` is the
+        exception — under a floor, a set that fits is exactly a set the search
+        would have found — so it overrides ``search`` rather than letting the
+        two callers answer differently.
         """
         count = req.gpu_cores
         pools = [pool for pool in self._gpu_pools(req) if len(pool) >= count]
         if not pools:
             return None
-        if count <= 0 or not search or not self.gpu_topology:
+        if count <= 0 or not self.gpu_topology or not (search or req.min_gpu_link):
             return pools[0][:count]
         return min(
             (self._closest_gpus(pool, count) for pool in pools),

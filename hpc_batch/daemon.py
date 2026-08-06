@@ -163,6 +163,13 @@ def _tidy_gb(gb: float) -> float:
     return math.floor(gb * 100) / 100
 
 
+def _gpu_note(gpus: list[int], link: str | None) -> str:
+    """The gpus a job got, and the link class pacing them when known."""
+    if not gpus:
+        return ""
+    return f", gpus {format_id_list(gpus)}" + (f" over {link}" if link else "")
+
+
 def _env_problem(env) -> str | None:
     """Why a submitted --env payload is unusable, or None if it is fine."""
     if not isinstance(env, dict):
@@ -706,17 +713,10 @@ class Daemon:
             job.id, job.pid,
             format_id_list(alloc.numa_nodes),
             format_id_list(alloc.cpus),
-            self._gpu_note(alloc),
+            _gpu_note(alloc.gpus, job.gpu_link),
             format_id_list(alloc.mem_nodes()),
             " (spans nodes: remote memory is slower)" if alloc.spans_nodes else "",
         )
-
-    def _gpu_note(self, alloc: Allocation) -> str:
-        """The gpus a job got, and the link class pacing them when known."""
-        if not alloc.gpus:
-            return ""
-        link = self.pool.gpu_topology.worst_link(alloc.gpus)
-        return f", gpus {format_id_list(alloc.gpus)}" + (f" over {link}" if link else "")
 
     def _job_env(self, job: Job, pw: pwd.struct_passwd, alloc: Allocation) -> dict[str, str]:
         defaults = {

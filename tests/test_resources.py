@@ -585,8 +585,21 @@ class TestGpuPlacement:
             req(gpu=2), req(cpu=4, gpu=3), req(cpu=4, gpu=4),
             req(cpu=2, gpu=1, mem=64.0), req(cpu=2, gpu=1, mem=48.0, numa_local_mem=True),
             req(cpu=2, gpu=2, numa_local_gpu=True), req(cpu=2, gpu=3, numa_local_gpu=True),
+            req(cpu=2, gpu=2, min_gpu_link="NV"), req(cpu=2, gpu=2, min_gpu_link="PIX"),
         ]:
             assert pool.would_fit(request) == (pool.clone().allocate(request) is not None)
+
+    def test_would_fit_still_agrees_under_a_link_floor(self):
+        # A floor is the one thing that makes *which* gpus a job gets decide
+        # whether it fits, so the cheap index-order answer would be wrong:
+        # gpu 0 is left stranded on one quad while a whole NVLinked pair is
+        # free on the other.
+        pool = quad_pool()
+        pool.reserve(held([0, 1, 2], node=0, gpus=[1, 2, 3]))
+        request = req(cpu=2, gpu=2, min_gpu_link="NV")
+        assert pool.would_fit(request) is True
+        alloc = pool.allocate(request)
+        assert alloc is not None and alloc.gpus == [4, 5]
 
     def test_gpu_affinity_never_overrides_the_memory_budget(self):
         pool = topo_pool()

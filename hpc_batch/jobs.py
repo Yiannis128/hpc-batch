@@ -139,10 +139,10 @@ class Job:
             "max_mem_gb": self.max_mem_gb,
             "mem_defaulted": self.mem_defaulted,
             # Remote memory is slower, so a job that had to spread its budget
-            # says so rather than quietly producing worse timings. Same for the
-            # link its gpus ended up talking over.
+            # says so rather than quietly producing worse timings.
             "mem_spans_nodes": len(charged_nodes(self.mem_by_node)) > 1,
             "gpus": len(self.gpus),
+            # Same bargain for the link its gpus ended up talking over.
             "gpu_link": self.gpu_link,
             "state": self.state,
             "exit_code": self.exit_code,

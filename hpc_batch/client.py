@@ -14,7 +14,7 @@ import time
 
 from . import __version__
 from .protocol import DONE, MAX_LINE, OOM, QUEUED, encode, socket_path
-from .resources import GPU_LINK_CHOICES
+from .resources import GPU_LINK_CHOICES, REMOTE_GPU_LINKS
 from .util import duration_arg, format_duration, format_gb, format_table, format_time
 
 
@@ -107,13 +107,8 @@ def _exit_label(job: dict) -> str:
     return "-" if code is None else str(code)
 
 
-#: Link classes where a peer-to-peer copy has left the GPUs' own PCIe tree
-#: and is paying for it. Flagged in `dispatch list` the way spread memory is.
-_FAR_GPU_LINKS = ("PHB", "NODE", "SYS")
-
-
 def _gpu_link_is_far(job: dict) -> bool:
-    return job.get("gpu_link") in _FAR_GPU_LINKS
+    return job.get("gpu_link") in REMOTE_GPU_LINKS
 
 
 def _gpu_label(job: dict) -> str:
@@ -122,7 +117,9 @@ def _gpu_label(job: dict) -> str:
     if not count:
         return "-"
     link = job.get("gpu_link")  # absent for a 1-gpu job: there is no pair
-    return f"{count} {link}{'!' if _gpu_link_is_far(job) else ''}" if link else str(count)
+    if not link:
+        return str(count)
+    return f"{count} {link}{'!' if _gpu_link_is_far(job) else ''}"
 
 
 def cmd_list(args: argparse.Namespace) -> int:
