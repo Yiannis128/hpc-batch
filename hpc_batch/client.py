@@ -73,6 +73,7 @@ def cmd_new(args: argparse.Namespace, command: list[str]) -> int:
         "max_time_s": args.max_time,
         "exclusive": args.exclusive,
         "numa_local": args.numa_local,
+        "env": dict(os.environ) if args.env else {},
         "output": output,
     }
     resp = _request(req)
@@ -232,6 +233,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_new.add_argument("--max-time", type=duration_arg, default=None, metavar="DURATION",
                        help="kill the job after this long, e.g. 30m or 2h "
                             "(default and upper bound: the admin's max lifetime)")
+    p_new.add_argument("--env", action="store_true",
+                       help="run the job with your current environment. "
+                            "Without this it gets a clean one (PATH, HOME, "
+                            "USER, SHELL, LANG). HPC_BATCH_JOB_ID and "
+                            "CUDA_VISIBLE_DEVICES are always set by the "
+                            "daemon and cannot be overridden")
     p_new.add_argument("--exclusive", action="store_true",
                        help="run alone: wait for an idle machine and block others while running")
     p_new.add_argument("--output", default=None, metavar="PATH",

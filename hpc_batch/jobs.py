@@ -21,6 +21,7 @@ class Job:
     max_time_s: int
     exclusive: bool
     numa_local: bool = False
+    env: dict[str, str] = field(default_factory=dict)  # --env; {} = clean
     mem_defaulted: bool = False  # budget assigned by us, not asked for
     state: str = QUEUED
     submit_time: float = 0.0

@@ -64,6 +64,7 @@ log = logging.getLogger("hpc-batchd")
 TICK_S = 1.0
 KILL_GRACE_S = 10.0
 ATTACH_POLL_S = 0.3
+MAX_ENV_BYTES = 256 * 1024
 # EX_CONFIG. Paired with RestartPreventExitStatus= in the unit: a daemon that
 # is misconfigured will be just as misconfigured two seconds later, and a
 # restart loop buries the one log line that says what is wrong.
@@ -157,6 +158,27 @@ def _tidy_gb(gb: float) -> float:
     return math.floor(gb * 100) / 100
 
 
+def _validate_env(raw) -> tuple[dict[str, str], str | None]:
+    """Check a submitted --env payload. Returns (env, error).
+
+    Bounded because it is stored and replayed: a queued job keeps its
+    environment across a daemon restart, and an unbounded one would sit in
+    the state file forever. The cap is well under the protocol's frame
+    limit, so an oversized environment is rejected with a reason rather than
+    killing the connection.
+    """
+    if raw is None:
+        return {}, None
+    if not isinstance(raw, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in raw.items()
+    ):
+        return {}, "env must be a mapping of strings to strings"
+    size = sum(len(k) + len(v) + 2 for k, v in raw.items())
+    if size > MAX_ENV_BYTES:
+        return {}, f"environment is too large ({size} bytes, limit {MAX_ENV_BYTES})"
+    return dict(raw), None
+
+
 def _group_exists(name: str) -> bool:
     try:
         grp.getgrnam(name)
@@ -241,6 +263,9 @@ class Daemon:
         self._setup_pool()
         self._resolve_admin_gid()
         self._load_state()
+        # Only now: _load_state finalizes the jobs that died while we were
+        # away, and finalizing reads memory.events out of their cgroups.
+        self.cgroups.prune()
         # Apply the retention limit to what we just loaded, so lowering
         # --keep-finished takes effect on the next start rather than only
         # once another job happens to finish.
@@ -405,6 +430,10 @@ class Daemon:
         }
         tmp = self.state_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=1))
+        # Root-only: this file holds every user's jobs, and with --env that
+        # includes whatever secrets were in the environment they submitted
+        # from. The default 0644 would publish them to the whole machine.
+        os.chmod(tmp, 0o600)
         os.replace(tmp, self.state_file)
         self._dirty = False
 
@@ -527,6 +556,10 @@ class Daemon:
             if problem:
                 return err(f"cannot save output there: {problem}")
 
+        env, problem = _validate_env(req.get("env"))
+        if problem:
+            return err(problem)
+
         job = Job(
             id=self.next_id,
             user=pw.pw_name,
@@ -540,6 +573,7 @@ class Daemon:
             max_time_s=max_time,
             exclusive=exclusive,
             numa_local=numa_local,
+            env=env,
             mem_defaulted=mem_defaulted,
             submit_time=time.time(),
             output_dest=output_dest,
@@ -631,26 +665,13 @@ class Daemon:
             drop_privileges(job.uid, pw.pw_gid, pw.pw_name)
             os.chdir(job.cwd)  # as the target user, so permissions apply
 
-        env = {
-            "HOME": pw.pw_dir,
-            "USER": pw.pw_name,
-            "LOGNAME": pw.pw_name,
-            "SHELL": pw.pw_shell or "/bin/sh",
-            "PATH": "/usr/local/bin:/usr/bin:/bin",
-            "LANG": os.environ.get("LANG", "C.UTF-8"),
-            "HPC_BATCH_JOB_ID": str(job.id),
-        }
-        if self.pool.gpu_ids:
-            # Empty string for 0-gpu jobs: they must not see any gpu.
-            env["CUDA_VISIBLE_DEVICES"] = format_id_list(alloc.gpus)
-
         try:
             proc = subprocess.Popen(
                 job.argv,
                 stdin=devnull,
                 stdout=out_fd,
                 stderr=out_fd,
-                env=env,
+                env=self._job_env(job, pw, alloc),
                 start_new_session=True,
                 preexec_fn=preexec,
             )
@@ -680,6 +701,29 @@ class Daemon:
             format_id_list(alloc.mem_nodes()),
             " (spans nodes: remote memory is slower)" if alloc.spans_nodes else "",
         )
+
+    def _job_env(self, job: Job, pw: pwd.struct_passwd, alloc: Allocation) -> dict[str, str]:
+        """The environment a job runs with: clean by default, the submitter's
+        own when they passed --env.
+
+        The last block is not overridable on purpose. CUDA_VISIBLE_DEVICES is
+        the whole of a job's gpu isolation, so a forwarded one letting a user
+        reach cards they were not allocated would be a way through it.
+        """
+        env = dict(job.env)
+        env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+        env.setdefault("LANG", os.environ.get("LANG", "C.UTF-8"))
+        env.update({
+            "HOME": pw.pw_dir,
+            "USER": pw.pw_name,
+            "LOGNAME": pw.pw_name,
+            "SHELL": pw.pw_shell or "/bin/sh",
+            "HPC_BATCH_JOB_ID": str(job.id),
+        })
+        if self.pool.gpu_ids:
+            # Empty string for 0-gpu jobs: they must not see any gpu.
+            env["CUDA_VISIBLE_DEVICES"] = format_id_list(alloc.gpus)
+        return env
 
     def _write_output_line(self, job: Job, text: str) -> None:
         with contextlib.suppress(OSError):
@@ -769,7 +813,10 @@ class Daemon:
         because it is then the only copy left.
         """
         src = self.output_path(job.id)
-        if job.output_dest:
+        # Not a start_time test: a job that failed in _try_start also never
+        # started, but its buffer holds the reason and still has to reach the
+        # user.
+        if job.output_dest and src.exists():
             dest = Path(job.output_dest)
 
             def copy() -> None:

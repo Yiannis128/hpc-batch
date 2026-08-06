@@ -1,16 +1,9 @@
 """cgroup v2 management for job isolation.
 
 Jobs go in `/sys/fs/cgroup/hpc-batch/job-<id>`, with cpuset (cpus pinned to
-one NUMA node) and memory limits applied. That tree is the daemon's own,
-deliberately outside its service cgroup.
-
-Nesting jobs under the service is the obvious layout and Delegate= invites
-it, but it makes the unit unrestartable. cgroup v2 forbids processes in a
-cgroup that has controllers enabled for its children, so once KillMode=
-process leaves jobs behind on stop, systemd cannot put a new daemon into
-the service cgroup and the start fails with 219/CGROUP -- for as long as
-any job lives. A separate tree is untouched by anything systemd does to
-the unit, which is what lets a restarted daemon re-adopt running jobs.
+one NUMA node) and memory limits applied. That tree sits outside the daemon's
+service cgroup: KillMode=process leaves jobs behind on stop, and systemd
+cannot recreate a service cgroup that still has processes in it (219/CGROUP).
 
 Isolation is all-or-nothing on purpose. If cgroups were asked for and
 cannot be delivered -- no cgroup v2, no root, a controller the root never
@@ -29,7 +22,6 @@ from .resources import format_id_list
 log = logging.getLogger(__name__)
 
 CGROUP_FS = Path("/sys/fs/cgroup")
-DEFAULT_ROOT = CGROUP_FS / "hpc-batch"
 _WANTED_CONTROLLERS = ("cpuset", "memory")
 
 _NO_CGROUPS = "pass --no-cgroups to run without isolation (development only)"
@@ -40,9 +32,9 @@ class CgroupError(Exception):
 
 
 class CgroupManager:
-    def __init__(self, enabled: bool = True, root: Path = DEFAULT_ROOT):
+    def __init__(self, enabled: bool = True, root: Path | None = None):
         self.enabled = enabled
-        self.root = root
+        self.root = root or CGROUP_FS / "hpc-batch"
         self.ready = False
         self.controllers: set[str] = set()
 
@@ -98,6 +90,24 @@ class CgroupManager:
             "cgroup subtree %s ready (controllers: %s)",
             self.root, ", ".join(sorted(self.controllers)),
         )
+
+    def prune(self) -> None:
+        """Remove job cgroups left behind by a previous daemon. rmdir refuses
+        one that still holds processes, so a job about to be re-adopted keeps
+        its own, and try_remove is the wrong tool here because it kills first.
+        Call it only once the daemon has finalized the jobs that died while it
+        was away: that reads memory.events out of their cgroups."""
+        if not self.ready:
+            return
+        removed = 0
+        for path in self.root.glob("job-*"):
+            try:
+                path.rmdir()
+            except OSError:
+                continue
+            removed += 1
+        if removed:
+            log.info("removed %d job cgroup(s) left by a previous daemon", removed)
 
     def create(
         self,

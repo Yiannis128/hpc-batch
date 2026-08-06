@@ -21,11 +21,24 @@ def manager(tmp_path: Path, controllers=("cpuset", "memory")) -> CgroupManager:
     return cg
 
 
-def fake_cgroup_fs(tmp_path: Path, monkeypatch, controllers="cpuset memory pids") -> Path:
-    """A stand-in for /sys/fs/cgroup whose root delegates `controllers`."""
-    (tmp_path / "cgroup.controllers").write_text(controllers + "\n")
+def fake_cgroup_fs(tmp_path: Path, monkeypatch, controllers="cpuset memory") -> Path:
+    """Stand in for /sys/fs/cgroup; returns the job subtree."""
+    (tmp_path / "cgroup.controllers").write_text("cpuset memory pids\n")
     monkeypatch.setattr(cgroup_mod, "CGROUP_FS", tmp_path)
-    return tmp_path
+    root = tmp_path / "hpc-batch"
+    root.mkdir()
+    (root / "cgroup.controllers").write_text(controllers + "\n")
+    return root
+
+
+def job_cgroup(root: Path, job_id: int, pids: str = "") -> Path:
+    # A job that ended is left as a bare directory: rmdir on real cgroupfs
+    # ignores the interface files, but on a temporary one they would block it.
+    path = root / f"job-{job_id}"
+    path.mkdir()
+    if pids:
+        (path / "cgroup.procs").write_text(pids)
+    return path
 
 
 def read(path: Path, name: str) -> str:
@@ -35,62 +48,35 @@ def read(path: Path, name: str) -> str:
 class TestSetup:
     """The job subtree lives outside the daemon's service cgroup, and has to
     survive the daemon being restarted underneath running jobs. Isolation the
-    admin asked for and cannot have is refused, never quietly downgraded.
-    These build the interface files the kernel would materialise on mkdir."""
+    admin asked for and cannot have is refused, never quietly downgraded."""
 
-    def test_claims_the_configured_subtree(self, tmp_path, monkeypatch):
-        fs = fake_cgroup_fs(tmp_path, monkeypatch)
-        root = fs / "hpc-batch"
-        root.mkdir()
-        (root / "cgroup.controllers").write_text("cpuset memory pids\n")
+    def test_claims_the_job_subtree(self, tmp_path, monkeypatch):
+        root = fake_cgroup_fs(tmp_path, monkeypatch)
 
-        cg = CgroupManager(root=root)
+        cg = CgroupManager()
 
         cg.setup()
 
         assert cg.controllers == {"cpuset", "memory"}
         assert cg.create(1, cpus=[0], mems=[0], mem_bytes=None) == root / "job-1"
 
-    def test_a_restart_leaves_live_job_cgroups_alone(self, tmp_path, monkeypatch):
-        # The outage this guards against: a daemon coming back must adopt the
-        # cgroups of jobs that outlived it, not disturb or recreate them.
-        fs = fake_cgroup_fs(tmp_path, monkeypatch)
-        root = fs / "hpc-batch"
-        root.mkdir()
-        (root / "cgroup.controllers").write_text("cpuset memory\n")
-        live = root / "job-7"
-        live.mkdir()
+    def test_claiming_an_existing_subtree_does_not_disturb_it(self, tmp_path, monkeypatch):
+        # A restarted daemon claims a tree it is already running jobs in.
+        root = fake_cgroup_fs(tmp_path, monkeypatch)
+        live = job_cgroup(root, 7, pids="4242\n")
         (live / "cpuset.cpus").write_text("12-23")
 
-        CgroupManager(root=root).setup()
+        CgroupManager().setup()
 
-        assert (live / "cpuset.cpus").read_text() == "12-23"
-
-    def test_creates_nothing_outside_its_own_subtree(self, tmp_path, monkeypatch):
-        # Putting jobs in the service cgroup is what made the unit
-        # unrestartable once a job outlived it, so setup writes nowhere else.
-        fs = fake_cgroup_fs(tmp_path, monkeypatch)
-        service = fs / "system.slice" / "hpc-batch.service"
-        service.mkdir(parents=True)
-        (service / "cgroup.procs").write_text("1234\n")
-        root = fs / "hpc-batch"
-        root.mkdir()
-        (root / "cgroup.controllers").write_text("cpuset memory\n")
-
-        CgroupManager(root=root).setup()
-
-        assert list(service.iterdir()) == [service / "cgroup.procs"]
+        assert read(live, "cpuset.cpus") == "12-23"
 
     def test_a_withheld_controller_is_refused_not_worked_around(self, tmp_path, monkeypatch):
         # Without cpuset a job's memory is not confined to its node. Carrying
         # on would keep every promise except the one that matters, and nothing
         # in the daemon's behaviour would look wrong.
-        fs = fake_cgroup_fs(tmp_path, monkeypatch)
-        root = fs / "hpc-batch"
-        root.mkdir()
-        (root / "cgroup.controllers").write_text("memory\n")
+        fake_cgroup_fs(tmp_path, monkeypatch, controllers="memory")
 
-        cg = CgroupManager(root=root)
+        cg = CgroupManager()
 
         with pytest.raises(CgroupError) as caught:
             cg.setup()
@@ -102,7 +88,7 @@ class TestSetup:
         monkeypatch.setattr(cgroup_mod, "CGROUP_FS", tmp_path)  # no cgroup.controllers
 
         with pytest.raises(CgroupError) as caught:
-            CgroupManager(root=tmp_path / "hpc-batch").setup()
+            CgroupManager().setup()
         assert "--no-cgroups" in str(caught.value)  # every refusal names the opt-out
 
     def test_no_cgroups_is_the_way_to_ask_for_the_fallback(self, tmp_path):
@@ -113,6 +99,32 @@ class TestSetup:
         assert cg.ready is False
         assert not (tmp_path / "hpc-batch").exists()
         assert cg.create(1, cpus=[0], mems=[0], mem_bytes=None) is None
+
+
+class TestPrune:
+    """Job cgroups outlive the daemon that made them, and nothing else reaps
+    them now that the tree sits outside the service cgroup."""
+
+    def test_reaps_the_cgroups_of_jobs_that_ended(self, tmp_path):
+        dead = job_cgroup(tmp_path, 3)
+
+        manager(tmp_path).prune()
+
+        assert not dead.exists()
+
+    def test_leaves_a_job_that_is_still_running_alone(self, tmp_path):
+        live = job_cgroup(tmp_path, 7, pids="4242\n")
+
+        manager(tmp_path).prune()
+
+        assert live.exists()
+
+    def test_does_nothing_until_a_subtree_has_been_claimed(self, tmp_path):
+        dead = job_cgroup(tmp_path, 3)
+
+        CgroupManager(root=tmp_path).prune()  # setup() never ran
+
+        assert dead.exists()
 
 
 class TestCreate:

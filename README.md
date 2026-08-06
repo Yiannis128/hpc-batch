@@ -13,15 +13,14 @@ and benchmark timings are stable.
 - **FIFO queue with pluggable scheduling** (`--schedule`, see below): jobs
   are always considered in submission order; the policy decides whether a
   later job may fill resources a blocked job cannot use.
-- **cgroups v2**: each job runs in its own cgroup under `/sys/fs/cgroup/
-  hpc-batch` with `cpuset.cpus`, `cpuset.mems` (same NUMA node as the
-  allocated CPUs) and `memory.max` applied. That tree is deliberately not
-  the daemon's service cgroup, so restarting the unit never disturbs a
-  running job. The unit still needs `Delegate=cpuset memory pids`, not to
-  nest anything under itself but because that is what makes systemd enable
-  those controllers at the cgroup root; without it the daemon refuses to
-  start rather than run without NUMA isolation. Swap is disabled for every
-  job (`memory.swap.max=0`):
+- **cgroups v2**: each job runs in its own cgroup under
+  `/sys/fs/cgroup/hpc-batch` with `cpuset.cpus`, `cpuset.mems` (same NUMA
+  node as the allocated CPUs) and `memory.max` applied. That tree is
+  deliberately not the daemon's service cgroup, so restarting the unit never
+  disturbs a running job; the unit still needs `Delegate=cpuset memory pids`
+  so those controllers exist at the cgroup root, and without it the daemon
+  refuses to start rather than run without NUMA isolation. Swap is disabled
+  for every job (`memory.swap.max=0`):
   `--max-mem` is a hard RAM budget, and a job that exceeds it is
   OOM-killed as a whole group instead of thrashing in swap.
 - **Every job has a memory budget, whether or not it asks for one.** An
@@ -61,7 +60,14 @@ and benchmark timings are stable.
   nothing is lost, and the error is reported by `dispatch list --finished`.
 - **Authentication**: the daemon identifies clients by `SO_PEERCRED` on the
   unix socket, so users cannot impersonate each other. Jobs are executed
-  under the submitting user's uid/gid with a clean environment.
+  under the submitting user's uid/gid.
+- **Environment**: a job gets a clean environment (`PATH`, `HOME`, `USER`,
+  `SHELL`, `LANG`) unless you pass `--env`, which forwards the one you
+  submitted from. `HPC_BATCH_JOB_ID` and `CUDA_VISIBLE_DEVICES` are always
+  set by the daemon and a forwarded value never wins: the latter is how a
+  job is held to the gpus it was allocated. A forwarded environment is
+  stored with the job so a queued one survives a daemon restart, which is
+  why the state file is root-only.
 - **Hot reload**: `systemctl reload hpc-batch` makes the daemon persist its
   state and re-exec itself in place. Running jobs are *not* killed; they are
   re-adopted by the new daemon (pid-reuse is guarded by comparing
@@ -216,6 +222,11 @@ dispatch new --cpu 2 --gpu-cores 3 --max-mem 84 --max-time 2h -- ./run_benchmark
 dispatch new --output ~/results -- ./run_benchmark.sh      # ~/results/output.<id>.log
 dispatch new --output ~/results/run1.log -- ./run_benchmark.sh
 dispatch new --no-output -- ./noisy_job.sh
+
+# Pass your current environment through instead of getting a clean one.
+# Drop anything you would rather not send in the same breath:
+dispatch new --env -- ./run_benchmark.sh
+HF_TOKEN= dispatch new --env -- ./run_benchmark.sh
 
 # Run alone on the machine (waits until idle, blocks others while running).
 # Without --cpu this takes every core and all the memory:

@@ -18,18 +18,14 @@ ExecStart=@HPC_BATCHD@ --max-lifetime 24h --admin-group @ADMIN_GROUP@
 ExecReload=/bin/kill -HUP $MAINPID
 
 # Jobs live in /sys/fs/cgroup/hpc-batch, which the daemon creates and owns,
-# NOT under this unit. Nothing is ever created inside the service cgroup, so
-# it stays a leaf: systemd can always remove and recreate it, even while jobs
-# from the previous daemon are still running.
-#
-# Delegate= is here only because it is what makes systemd enable cpuset and
-# memory at the cgroup root, which is where our tree inherits them from.
-# Without it the daemon silently drops to affinity-only pinning and loses
-# NUMA isolation entirely. Deleting this line looks right and is not.
+# not under this unit: the service cgroup holds only the daemon, so it empties
+# on stop and systemd can always recreate it, even while jobs from the previous
+# daemon are still running. Delegate= is still needed, not to nest anything
+# under the unit but because it is what makes systemd enable cpuset and memory
+# at the cgroup root, where our tree inherits them from.
 Delegate=cpuset memory pids
 
-# The daemon only. Jobs get memory.swap.max=0 written into their own cgroup:
-# swapping would wreck benchmark timings.
+# The daemon only; jobs get memory.swap.max=0 in their own cgroup.
 MemorySwapMax=0
 # Only kill the daemon itself on stop/restart; jobs keep running and are
 # re-adopted when the daemon comes back.
