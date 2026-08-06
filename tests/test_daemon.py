@@ -188,6 +188,32 @@ class TestRetireOutput:
 
         assert not daemon.output_path(1).exists()
 
+    def test_a_job_killed_off_the_queue_delivers_nothing(self, tmp_path):
+        # It never ran, so there is no buffer and nothing was lost. Reporting
+        # a delivery failure here left every cancelled job warning about
+        # output that never existed, for the rest of its retention.
+        daemon = make_daemon(tmp_path)
+        job = add_job(daemon, 1, output=False)
+        job.start_time = None
+        job.output_dest = str(tmp_path / "kept.log")
+
+        daemon._retire_output(job)
+
+        assert job.output_error is None
+        assert not (tmp_path / "kept.log").exists()
+
+    def test_a_job_that_failed_to_start_still_delivers_its_reason(self, tmp_path):
+        # Also never started, but _try_start wrote why into the buffer.
+        daemon = make_daemon(tmp_path)
+        job = add_job(daemon, 1, output=True)
+        job.start_time = None
+        job.output_dest = str(tmp_path / "kept.log")
+
+        daemon._retire_output(job)
+
+        assert job.output_error is None
+        assert (tmp_path / "kept.log").read_bytes() == b"captured output\n"
+
     def test_buffer_survives_a_failed_delivery(self, tmp_path):
         # Otherwise this would be the only copy, and we would be deleting the
         # user's results precisely because we could not hand them over.
