@@ -81,6 +81,14 @@ class TestRunAsUser:
         assert "PermissionError" in msg
         assert "/nope" in msg
 
+    def test_a_systemexit_is_still_a_failure(self):
+        # Narrowing the handler to Exception would let this one through, and
+        # the child's os._exit would then report success.
+        def bail():
+            raise SystemExit(0)
+
+        assert run_as_user(os.getuid(), os.getgid(), "nobody", bail) is not None
+
     def test_child_cannot_mutate_the_parent(self, tmp_path):
         # The work happens after a fork, so anything the callback computes is
         # lost. Callers must not rely on side effects, only on the verdict.
