@@ -1,11 +1,9 @@
 """cgroup v2 management for job isolation.
 
-The daemon runs as a systemd service with Delegate=, so it owns its own
-cgroup subtree. To create child cgroups we first move ourselves into a
-`supervisor` leaf (cgroup v2 forbids processes in inner nodes), enable the
-controllers we need on the service cgroup, then place every job in its own
-`job-<id>` child with cpuset (cpus pinned to one NUMA node) and memory
-limits applied.
+Jobs go in `/sys/fs/cgroup/hpc-batch/job-<id>`, with cpuset (cpus pinned to
+one NUMA node) and memory limits applied. That tree sits outside the daemon's
+service cgroup: KillMode=process leaves jobs behind on stop, and systemd
+cannot recreate a service cgroup that still has processes in it (219/CGROUP).
 
 Everything degrades gracefully: when cgroups are unavailable (not root,
 no cgroup v2, missing controllers) the daemon falls back to
@@ -24,61 +22,67 @@ CGROUP_FS = Path("/sys/fs/cgroup")
 _WANTED_CONTROLLERS = ("cpuset", "memory")
 
 
-def _own_cgroup() -> Path | None:
-    """Absolute path of the cgroup this process lives in (v2 only)."""
-    try:
-        for line in Path("/proc/self/cgroup").read_text().splitlines():
-            if line.startswith("0::"):
-                rel = line[3:].strip("/")
-                return CGROUP_FS / rel if rel else CGROUP_FS
-    except OSError:
-        pass
-    return None
-
-
 class CgroupManager:
-    def __init__(self, enabled: bool = True):
+    def __init__(self, enabled: bool = True, root: Path | None = None):
         self.enabled = enabled
-        self.base: Path | None = None
+        self.root = root or CGROUP_FS / "hpc-batch"
+        self.ready = False
         self.controllers: set[str] = set()
 
     def setup(self) -> bool:
-        """Claim our delegated subtree. Returns True when cgroups are usable."""
+        """Claim the job subtree, creating it if a previous daemon has not.
+        Returns True when cgroups are usable."""
         if not self.enabled:
             log.info("cgroups disabled by configuration")
             return False
-        own = _own_cgroup()
-        if own is None or not (CGROUP_FS / "cgroup.controllers").exists():
+        if not (CGROUP_FS / "cgroup.controllers").exists():
             log.warning("cgroup v2 not available; jobs will not be isolated")
             return False
-        # After a re-exec we are already inside the supervisor leaf.
-        base = own.parent if own.name == "supervisor" else own
-        if base == CGROUP_FS:
-            log.warning("refusing to manage the cgroup root; jobs will not be isolated")
-            return False
         try:
-            supervisor = base / "supervisor"
-            supervisor.mkdir(exist_ok=True)
-            # Move every process (normally just us) out of the inner node.
-            procs = (base / "cgroup.procs").read_text().split()
-            for pid in procs:
-                (supervisor / "cgroup.procs").write_text(pid)
-            available = set((base / "cgroup.controllers").read_text().split())
+            self.root.mkdir(exist_ok=True)
+            available = set((self.root / "cgroup.controllers").read_text().split())
             for ctrl in _WANTED_CONTROLLERS:
                 if ctrl not in available:
-                    log.warning("cgroup controller %r not delegated to us", ctrl)
+                    log.warning("cgroup controller %r not enabled for %s", ctrl, self.root)
                     continue
                 try:
-                    (base / "cgroup.subtree_control").write_text(f"+{ctrl}")
+                    (self.root / "cgroup.subtree_control").write_text(f"+{ctrl}")
                     self.controllers.add(ctrl)
                 except OSError as exc:
                     log.warning("could not enable cgroup controller %r: %s", ctrl, exc)
         except OSError as exc:
             log.warning("cgroup setup failed (%s); jobs will not be isolated", exc)
             return False
-        self.base = base
-        log.info("cgroup subtree %s ready (controllers: %s)", base, ", ".join(sorted(self.controllers)) or "none")
+        self.ready = True
+        log.info(
+            "cgroup subtree %s ready (controllers: %s)",
+            self.root, ", ".join(sorted(self.controllers)) or "none",
+        )
+        if "cpuset" not in self.controllers:
+            log.warning(
+                "NO NUMA ISOLATION: jobs fall back to cpu-affinity pinning and "
+                "their memory is not confined to a node. Check that the unit "
+                "still has 'Delegate=cpuset memory pids'."
+            )
         return True
+
+    def prune(self) -> None:
+        """Remove job cgroups left behind by a previous daemon. rmdir refuses
+        one that still holds processes, so a job about to be re-adopted keeps
+        its own, and try_remove is the wrong tool here because it kills first.
+        Call it only once the daemon has finalized the jobs that died while it
+        was away: that reads memory.events out of their cgroups."""
+        if not self.ready:
+            return
+        removed = 0
+        for path in self.root.glob("job-*"):
+            try:
+                path.rmdir()
+            except OSError:
+                continue
+            removed += 1
+        if removed:
+            log.info("removed %d job cgroup(s) left by a previous daemon", removed)
 
     def create(
         self,
@@ -94,9 +98,9 @@ class CgroupManager:
         those nodes is what makes the accounting binding: the job cannot
         allocate memory on a node nobody budgeted for it.
         """
-        if self.base is None:
+        if not self.ready:
             return None
-        path = self.base / f"job-{job_id}"
+        path = self.root / f"job-{job_id}"
         path.mkdir(exist_ok=True)
         if "cpuset" in self.controllers:
             (path / "cpuset.cpus").write_text(format_id_list(cpus))

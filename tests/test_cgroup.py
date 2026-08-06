@@ -8,18 +8,113 @@ mistake in it silently turns a hard guarantee into a hope.
 
 from pathlib import Path
 
+from hpc_batch import cgroup as cgroup_mod
 from hpc_batch.cgroup import CgroupManager
 
 
 def manager(tmp_path: Path, controllers=("cpuset", "memory")) -> CgroupManager:
-    cg = CgroupManager(enabled=True)
-    cg.base = tmp_path
+    cg = CgroupManager(enabled=True, root=tmp_path)
+    cg.ready = True
     cg.controllers = set(controllers)
     return cg
 
 
+def fake_cgroup_fs(tmp_path: Path, monkeypatch, controllers="cpuset memory") -> Path:
+    """Stand in for /sys/fs/cgroup; returns the job subtree."""
+    (tmp_path / "cgroup.controllers").write_text("cpuset memory pids\n")
+    monkeypatch.setattr(cgroup_mod, "CGROUP_FS", tmp_path)
+    root = tmp_path / "hpc-batch"
+    root.mkdir()
+    (root / "cgroup.controllers").write_text(controllers + "\n")
+    return root
+
+
+def job_cgroup(root: Path, job_id: int, pids: str = "") -> Path:
+    # A job that ended is left as a bare directory: rmdir on real cgroupfs
+    # ignores the interface files, but on a temporary one they would block it.
+    path = root / f"job-{job_id}"
+    path.mkdir()
+    if pids:
+        (path / "cgroup.procs").write_text(pids)
+    return path
+
+
 def read(path: Path, name: str) -> str:
     return (path / name).read_text()
+
+
+class TestSetup:
+    """The job subtree lives outside the daemon's service cgroup, and has to
+    survive the daemon being restarted underneath running jobs."""
+
+    def test_claims_the_job_subtree(self, tmp_path, monkeypatch, caplog):
+        root = fake_cgroup_fs(tmp_path, monkeypatch)
+
+        cg = CgroupManager()
+
+        assert cg.setup() is True
+        assert cg.controllers == {"cpuset", "memory"}
+        assert cg.create(1, cpus=[0], mems=[0], mem_bytes=None) == root / "job-1"
+        assert "NO NUMA ISOLATION" not in caplog.text
+
+    def test_claiming_an_existing_subtree_does_not_disturb_it(self, tmp_path, monkeypatch):
+        # A restarted daemon claims a tree it is already running jobs in.
+        root = fake_cgroup_fs(tmp_path, monkeypatch)
+        live = job_cgroup(root, 7, pids="4242\n")
+        (live / "cpuset.cpus").write_text("12-23")
+
+        assert CgroupManager().setup() is True
+
+        assert read(live, "cpuset.cpus") == "12-23"
+
+    def test_a_controller_the_kernel_root_withholds_is_skipped(self, tmp_path, monkeypatch, caplog):
+        fake_cgroup_fs(tmp_path, monkeypatch, controllers="memory")
+
+        cg = CgroupManager()
+
+        assert cg.setup() is True
+        assert cg.controllers == {"memory"}
+        assert "NO NUMA ISOLATION" in caplog.text
+
+    def test_without_cgroup_v2_jobs_fall_back_to_affinity(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cgroup_mod, "CGROUP_FS", tmp_path)  # no cgroup.controllers
+        cg = CgroupManager()
+
+        assert cg.setup() is False
+        assert cg.create(1, cpus=[0], mems=[0], mem_bytes=None) is None
+
+    def test_disabled_by_configuration(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cgroup_mod, "CGROUP_FS", tmp_path)
+        cg = CgroupManager(enabled=False)
+
+        assert cg.setup() is False
+        assert not (tmp_path / "hpc-batch").exists()
+
+
+class TestPrune:
+    """Job cgroups outlive the daemon that made them, and nothing else reaps
+    them now that the tree sits outside the service cgroup."""
+
+    def test_reaps_the_cgroups_of_jobs_that_ended(self, tmp_path):
+        dead = job_cgroup(tmp_path, 3)
+
+        manager(tmp_path).prune()
+
+        assert not dead.exists()
+
+    def test_leaves_a_job_that_is_still_running_alone(self, tmp_path):
+        live = job_cgroup(tmp_path, 7, pids="4242\n")
+
+        manager(tmp_path).prune()
+
+        assert live.exists()
+
+    def test_does_nothing_until_a_subtree_has_been_claimed(self, tmp_path):
+        dead = job_cgroup(tmp_path, 3)
+
+        CgroupManager(root=tmp_path).prune()  # setup() never ran
+
+        assert dead.exists()
 
 
 class TestCreate:
@@ -57,7 +152,7 @@ class TestCreate:
         assert not (path / "cpuset.cpus").exists()
         assert read(path, "memory.max") == str(1 << 30)
 
-    def test_returns_none_without_a_delegated_subtree(self, tmp_path):
+    def test_returns_none_before_setup_has_claimed_a_subtree(self, tmp_path):
         cg = CgroupManager(enabled=True)
         assert cg.create(12, cpus=[0], mems=[0], mem_bytes=None) is None
 
