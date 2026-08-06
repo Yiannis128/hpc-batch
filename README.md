@@ -1,5 +1,7 @@
 # hpc-batch
 
+[![CI](https://github.com/Yiannis128/hpc-batch/actions/workflows/ci.yml/badge.svg)](https://github.com/Yiannis128/hpc-batch/actions/workflows/ci.yml)
+
 A single-node batch job system for shared HPC/benchmark machines. A root
 daemon (`hpc-batchd`, run from systemd) accepts job submissions from users
 via the `dispatch` CLI, queues them FIFO, and runs each one in its own
@@ -273,4 +275,9 @@ dispatch list
 ```
 
 In user mode the daemon only accepts jobs from its own uid (it cannot
-setuid) and falls back from cgroups to CPU affinity pinning.
+setuid), and `--no-cgroups` is required: without it the daemon refuses to
+start rather than run a shared machine's worth of jobs unisolated.
+
+CI runs the suite on Python 3.10 through 3.13, builds both artefacts, and
+checks that the wheel still carries the systemd unit and that the installed
+entry points refuse a non-root run.
