@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Linux only, and not by omission: the daemon is built on cgroup v2,
+    # SO_PEERCRED, fork and setuid, none of which have a meaning elsewhere.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      # Installing the package rather than adding the checkout to sys.path,
+      # so the run also proves it installs on the versions we advertise.
+      - run: pip install . pytest
+      - run: python -m pytest tests -q
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install hatch
+      - run: hatch build
+      - name: The wheel must carry the systemd unit
+        run: python scripts/check_wheel.py
+      - name: The installed entry points must exist and refuse a non-root run
+        run: |
+          python -m venv /tmp/verify
+          /tmp/verify/bin/pip install --quiet dist/*.whl
+          for name in dispatch hpc-batchd hpc-batch-install; do
+            test -x "/tmp/verify/bin/$name" || { echo "missing $name"; exit 1; }
+          done
+          if /tmp/verify/bin/hpc-batch-install; then
+            echo "installer should have refused to run as non-root"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
