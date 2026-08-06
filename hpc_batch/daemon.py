@@ -132,7 +132,10 @@ def run_as_user(uid: int, gid: int, user: str, fn) -> str | None:
         try:
             drop_privileges(uid, gid, user)
             fn()
-        except BaseException as exc:  # noqa: BLE001 - reported to the parent
+        except BaseException as exc:
+            # BaseException rather than Exception: a SystemExit raised by fn
+            # would skip a narrower handler, and the exit below would then
+            # report success to the parent.
             msg = f"{type(exc).__name__}: {exc}"[:400]
         finally:
             with contextlib.suppress(OSError):
