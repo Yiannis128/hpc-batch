@@ -1,16 +1,10 @@
 """cgroup v2 management for job isolation.
 
 Jobs go in `/sys/fs/cgroup/hpc-batch/job-<id>`, with cpuset (cpus pinned to
-one NUMA node) and memory limits applied. That tree is the daemon's own,
-deliberately outside its service cgroup.
-
-Nesting jobs under the service is the obvious layout and Delegate= invites
-it, but it makes the unit unrestartable. cgroup v2 forbids processes in a
-cgroup that has controllers enabled for its children, so once KillMode=
-process leaves jobs behind on stop, systemd cannot put a new daemon into
-the service cgroup and the start fails with 219/CGROUP -- for as long as
-any job lives. A separate tree is untouched by anything systemd does to
-the unit, which is what lets a restarted daemon re-adopt running jobs.
+one NUMA node) and memory limits applied. That tree is deliberately outside
+the daemon's service cgroup: jobs KillMode=process leaves behind would keep
+that cgroup populated, and systemd could not recreate it on restart
+(219/CGROUP) for as long as any of them lived.
 
 Everything degrades gracefully: when cgroups are unavailable (not root,
 no cgroup v2, missing controllers) the daemon falls back to
@@ -26,25 +20,20 @@ from .resources import format_id_list
 log = logging.getLogger(__name__)
 
 CGROUP_FS = Path("/sys/fs/cgroup")
-DEFAULT_ROOT = CGROUP_FS / "hpc-batch"
 _WANTED_CONTROLLERS = ("cpuset", "memory")
 
 
 class CgroupManager:
-    def __init__(self, enabled: bool = True, root: Path = DEFAULT_ROOT):
+    def __init__(self, enabled: bool = True, root: Path | None = None):
         self.enabled = enabled
-        self.root = root
+        self.root = root or CGROUP_FS / "hpc-batch"
         self.ready = False
         self.controllers: set[str] = set()
 
     def setup(self) -> bool:
-        """Create and claim the job subtree. Returns True when cgroups are
-        usable.
-
-        Idempotent over an existing tree, because that is the restart case:
-        the job cgroups of everything still running are sitting in it, and a
-        daemon that has just come back has to adopt them, not disturb them.
-        """
+        """Create or reclaim the job subtree, leaving the cgroups of jobs that
+        outlived the previous daemon alone. Returns True when cgroups are
+        usable."""
         if not self.enabled:
             log.info("cgroups disabled by configuration")
             return False
@@ -71,17 +60,11 @@ class CgroupManager:
             "cgroup subtree %s ready (controllers: %s)",
             self.root, ", ".join(sorted(self.controllers)) or "none",
         )
-        # Said plainly because the daemon keeps working without it: jobs still
-        # run, still get their cpus, and nothing looks wrong. What is gone is
-        # the guarantee that memory stays on the node those cpus are on, which
-        # is the reason this tool exists. Almost always Delegate= missing from
-        # the unit, which is what makes systemd enable cpuset at the root.
         if "cpuset" not in self.controllers:
             log.warning(
-                "NO NUMA ISOLATION: the cpuset controller is not available in "
-                "%s, so jobs fall back to cpu-affinity pinning and their memory "
-                "is not confined to a node. Check that the unit still has "
-                "'Delegate=cpuset memory pids'.", self.root,
+                "NO NUMA ISOLATION: jobs fall back to cpu-affinity pinning and "
+                "their memory is not confined to a node. Check that the unit "
+                "still has 'Delegate=cpuset memory pids'."
             )
         return True
 

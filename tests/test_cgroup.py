@@ -19,11 +19,16 @@ def manager(tmp_path: Path, controllers=("cpuset", "memory")) -> CgroupManager:
     return cg
 
 
-def fake_cgroup_fs(tmp_path: Path, monkeypatch, controllers="cpuset memory pids") -> Path:
-    """A stand-in for /sys/fs/cgroup whose root delegates `controllers`."""
-    (tmp_path / "cgroup.controllers").write_text(controllers + "\n")
+def fake_cgroup_fs(tmp_path: Path, monkeypatch, controllers="cpuset memory") -> Path:
+    """Stand in for /sys/fs/cgroup, building the interface files the kernel
+    would materialise. Returns the job subtree, which has `controllers` to
+    hand out to its children."""
+    (tmp_path / "cgroup.controllers").write_text("cpuset memory pids\n")
     monkeypatch.setattr(cgroup_mod, "CGROUP_FS", tmp_path)
-    return tmp_path
+    root = tmp_path / "hpc-batch"
+    root.mkdir()
+    (root / "cgroup.controllers").write_text(controllers + "\n")
+    return root
 
 
 def read(path: Path, name: str) -> str:
@@ -32,85 +37,61 @@ def read(path: Path, name: str) -> str:
 
 class TestSetup:
     """The job subtree lives outside the daemon's service cgroup, and has to
-    survive the daemon being restarted underneath running jobs. These build
-    the interface files the kernel would materialise on mkdir."""
+    survive the daemon being restarted underneath running jobs."""
 
-    def test_claims_the_configured_subtree(self, tmp_path, monkeypatch):
-        fs = fake_cgroup_fs(tmp_path, monkeypatch)
-        root = fs / "hpc-batch"
-        root.mkdir()
-        (root / "cgroup.controllers").write_text("cpuset memory pids\n")
+    def test_claims_the_job_subtree(self, tmp_path, monkeypatch, caplog):
+        root = fake_cgroup_fs(tmp_path, monkeypatch)
 
-        cg = CgroupManager(root=root)
+        cg = CgroupManager()
 
         assert cg.setup() is True
         assert cg.controllers == {"cpuset", "memory"}
         assert cg.create(1, cpus=[0], mems=[0], mem_bytes=None) == root / "job-1"
+        assert "NO NUMA ISOLATION" not in caplog.text
 
     def test_a_restart_leaves_live_job_cgroups_alone(self, tmp_path, monkeypatch):
         # The outage this guards against: a daemon coming back must adopt the
         # cgroups of jobs that outlived it, not disturb or recreate them.
-        fs = fake_cgroup_fs(tmp_path, monkeypatch)
-        root = fs / "hpc-batch"
-        root.mkdir()
-        (root / "cgroup.controllers").write_text("cpuset memory\n")
+        root = fake_cgroup_fs(tmp_path, monkeypatch)
         live = root / "job-7"
         live.mkdir()
         (live / "cpuset.cpus").write_text("12-23")
 
-        assert CgroupManager(root=root).setup() is True
+        assert CgroupManager().setup() is True
 
-        assert (live / "cpuset.cpus").read_text() == "12-23"
+        assert read(live, "cpuset.cpus") == "12-23"
 
     def test_creates_nothing_outside_its_own_subtree(self, tmp_path, monkeypatch):
         # Putting jobs in the service cgroup is what made the unit
         # unrestartable once a job outlived it, so setup writes nowhere else.
-        fs = fake_cgroup_fs(tmp_path, monkeypatch)
-        service = fs / "system.slice" / "hpc-batch.service"
+        fake_cgroup_fs(tmp_path, monkeypatch)
+        service = tmp_path / "system.slice" / "hpc-batch.service"
         service.mkdir(parents=True)
         (service / "cgroup.procs").write_text("1234\n")
-        root = fs / "hpc-batch"
-        root.mkdir()
-        (root / "cgroup.controllers").write_text("cpuset memory\n")
 
-        CgroupManager(root=root).setup()
+        CgroupManager().setup()
 
         assert list(service.iterdir()) == [service / "cgroup.procs"]
 
     def test_a_controller_the_kernel_root_withholds_is_skipped(self, tmp_path, monkeypatch, caplog):
-        # Losing cpuset costs NUMA isolation while everything still appears to
-        # work, so it has to be said outright rather than inferred from the
-        # controller list in the ready line.
-        fs = fake_cgroup_fs(tmp_path, monkeypatch)
-        root = fs / "hpc-batch"
-        root.mkdir()
-        (root / "cgroup.controllers").write_text("memory\n")
+        fake_cgroup_fs(tmp_path, monkeypatch, controllers="memory")
 
-        cg = CgroupManager(root=root)
+        cg = CgroupManager()
 
         assert cg.setup() is True
         assert cg.controllers == {"memory"}
         assert "NO NUMA ISOLATION" in caplog.text
 
-    def test_a_full_subtree_says_nothing_alarming(self, tmp_path, monkeypatch, caplog):
-        fs = fake_cgroup_fs(tmp_path, monkeypatch)
-        root = fs / "hpc-batch"
-        root.mkdir()
-        (root / "cgroup.controllers").write_text("cpuset memory\n")
-
-        CgroupManager(root=root).setup()
-
-        assert "NO NUMA ISOLATION" not in caplog.text
-
     def test_without_cgroup_v2_jobs_fall_back_to_affinity(self, tmp_path, monkeypatch):
         monkeypatch.setattr(cgroup_mod, "CGROUP_FS", tmp_path)  # no cgroup.controllers
-        cg = CgroupManager(root=tmp_path / "hpc-batch")
+        cg = CgroupManager()
 
         assert cg.setup() is False
         assert cg.create(1, cpus=[0], mems=[0], mem_bytes=None) is None
 
-    def test_disabled_by_configuration(self, tmp_path):
-        cg = CgroupManager(enabled=False, root=tmp_path / "hpc-batch")
+    def test_disabled_by_configuration(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cgroup_mod, "CGROUP_FS", tmp_path)
+        cg = CgroupManager(enabled=False)
 
         assert cg.setup() is False
         assert not (tmp_path / "hpc-batch").exists()

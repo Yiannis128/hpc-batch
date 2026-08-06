@@ -11,14 +11,12 @@ and benchmark timings are stable.
 - **FIFO queue with pluggable scheduling** (`--schedule`, see below): jobs
   are always considered in submission order; the policy decides whether a
   later job may fill resources a blocked job cannot use.
-- **cgroups v2**: each job runs in its own cgroup under `/sys/fs/cgroup/
-  hpc-batch` with `cpuset.cpus`, `cpuset.mems` (same NUMA node as the
-  allocated CPUs) and `memory.max` applied. That tree is deliberately not
-  the daemon's service cgroup, so restarting the unit never disturbs a
-  running job. The unit still needs `Delegate=cpuset memory pids`, not to
-  nest anything under itself but because that is what makes systemd enable
-  those controllers at the cgroup root; without it the daemon drops to
-  affinity-only pinning and says so loudly at startup. Swap is disabled for
+- **cgroups v2**: each job runs in its own cgroup under
+  `/sys/fs/cgroup/hpc-batch` with `cpuset.cpus`, `cpuset.mems` (same NUMA
+  node as the allocated CPUs) and `memory.max` applied. That tree is
+  deliberately not the daemon's service cgroup, so restarting the unit never
+  disturbs a running job; the unit still needs `Delegate=cpuset memory pids`
+  so those controllers exist at the cgroup root. Swap is disabled for
   every job (`memory.swap.max=0`):
   `--max-mem` is a hard RAM budget, and a job that exceeds it is
   OOM-killed as a whole group instead of thrashing in swap.
