@@ -8,6 +8,7 @@ from hpc_batch.util import (
     format_table,
     format_time,
     parse_duration,
+    split_assignments,
 )
 
 
@@ -144,3 +145,34 @@ class TestFormatGb:
         # A budget of 0 is a real (if useless) limit; rendering it as "-"
         # would claim the job has no limit at all.
         assert format_gb(0.0) == "0G"
+
+
+class TestSplitAssignments:
+    def test_leading_assignments_are_environment(self):
+        env, rest = split_assignments(["FOO=bar", "N=1", "/bin/echo", "hi"])
+        assert env == {"FOO": "bar", "N": "1"}
+        assert rest == ["/bin/echo", "hi"]
+
+    def test_stops_at_the_command(self):
+        # Only leading words are environment: an argument that happens to look
+        # like an assignment belongs to the job.
+        env, rest = split_assignments(["/bin/make", "CC=gcc"])
+        assert env == {}
+        assert rest == ["/bin/make", "CC=gcc"]
+
+    def test_paths_are_never_assignments(self):
+        for word in ["./x=y", "/usr/bin/x=y", "1FOO=bar", "-o=v"]:
+            assert split_assignments([word]) == ({}, [word])
+
+    def test_empty_value(self):
+        assert split_assignments(["FOO=", "/bin/true"]) == ({"FOO": ""}, ["/bin/true"])
+
+    def test_value_may_contain_equals(self):
+        env, rest = split_assignments(["EXPR=a=b", "/bin/true"])
+        assert env == {"EXPR": "a=b"}
+        assert rest == ["/bin/true"]
+
+    def test_assignments_only_leaves_no_command(self):
+        # The caller reports "no command given" from this, so the split must
+        # not silently treat the last assignment as the program.
+        assert split_assignments(["FOO=bar"]) == ({"FOO": "bar"}, [])

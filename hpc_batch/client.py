@@ -16,7 +16,14 @@ from . import __version__
 from .modify import FIELDS
 from .protocol import DONE, MAX_LINE, OOM, QUEUED, encode, socket_path
 from .resources import GPU_LINK_CHOICES, REMOTE_GPU_LINKS
-from .util import duration_arg, format_duration, format_gb, format_table, format_time
+from .util import (
+    duration_arg,
+    format_duration,
+    format_gb,
+    format_table,
+    format_time,
+    split_assignments,
+)
 
 
 class DispatchError(Exception):
@@ -61,7 +68,7 @@ def _request(req: dict) -> dict:
 # -- subcommands ---------------------------------------------------------
 
 
-def cmd_new(args: argparse.Namespace, command: list[str]) -> int:
+def cmd_new(args: argparse.Namespace, command: list[str], job_env: dict[str, str]) -> int:
     # Resolve --output here: the daemon's cwd is "/", so a relative path only
     # means what the user intended if we make it absolute on their side.
     output = None if args.no_output else os.path.abspath(args.output or os.getcwd())
@@ -77,7 +84,9 @@ def cmd_new(args: argparse.Namespace, command: list[str]) -> int:
         "numa_local_mem": args.numa_local or args.numa_local_mem,
         "numa_local_gpu": args.numa_local or args.numa_local_gpu,
         "min_gpu_link": args.gpu_link,
-        "env": dict(os.environ) if args.env else {},
+        # Named on the command line last, so an explicit assignment beats a
+        # variable of the same name swept up by --env.
+        "env": (dict(os.environ) if args.env else {}) | job_env,
         "output": output,
     }
     resp = _request(req)
@@ -260,8 +269,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="submit a job",
         usage="dispatch new [options] -- <command> [args...]",
         description="Submit a job to the FIFO queue. Everything after '--' is "
-                    "executed as your user once the requested resources are free. "
-                    "Output is captured and available via 'dispatch attach'.",
+                    "executed as your user once the requested resources are free, "
+                    "with any leading NAME=VALUE words taken as environment, as "
+                    "`env` does. Output is captured and available via "
+                    "'dispatch attach'.",
     )
     p_new.add_argument("--cpu", type=int, default=None, metavar="N",
                        help="cpu cores to allocate, all from one NUMA node "
@@ -298,7 +309,8 @@ def build_parser() -> argparse.ArgumentParser:
                             "(default and upper bound: the admin's max lifetime)")
     p_new.add_argument("--env", action="store_true",
                        help="run the job with your current environment instead of a "
-                            "clean one; the daemon's own variables still win")
+                            "clean one; NAME=VALUE words before the command still "
+                            "override it, and the daemon's own variables win over both")
     p_new.add_argument("--exclusive", action="store_true",
                        help="run alone: wait for an idle machine and block others while running")
     p_new.add_argument("--output", default=None, metavar="PATH",
@@ -386,9 +398,10 @@ def main(argv: list[str] | None = None) -> int:
     # Everything after the first bare "--" is the job's command line; split it
     # off before argparse so job arguments are never mistaken for our options.
     command: list[str] = []
+    job_env: dict[str, str] = {}
     if argv and argv[0] == "new" and "--" in argv:
         split = argv.index("--")
-        command = argv[split + 1:]
+        job_env, command = split_assignments(argv[split + 1:])
         argv = argv[:split]
 
     parser = build_parser()
@@ -398,7 +411,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "new":
             if not command:
                 parser.error("no command given; usage: dispatch new [options] -- <command>")
-            return cmd_new(args, command)
+            return cmd_new(args, command, job_env)
         if args.command == "list":
             return cmd_list(args)
         if args.command == "attach":
