@@ -13,11 +13,14 @@ from hpc_batch.install import (
     DEFAULT_BIN_DIR,
     InstallError,
     bin_dirs_to_clean,
+    daemon_paths,
     detect_admin_group,
     login_path_provides,
     profile_snippet,
     read_record,
+    remove_cgroup_tree,
     render_unit,
+    safe_to_remove,
     settle,
     unit_template,
     write_record,
@@ -204,6 +207,65 @@ class TestBinDirsToClean:
 
     def test_no_record_falls_back_to_the_default(self):
         assert bin_dirs_to_clean({}, None) == {DEFAULT_BIN_DIR}
+
+
+class TestDaemonPaths:
+    def test_falls_back_to_the_daemons_own_defaults(self):
+        paths = daemon_paths("ExecStart=/opt/bin/hpc-batchd --max-lifetime 24h")
+        assert paths["state_dir"] == Path("/var/lib/hpc-batch")
+        assert paths["dev_dir"] == Path("/dev/hpc-batch")
+        assert paths["socket"] == Path("/run/hpc-batch/hpc-batch.sock")
+
+    def test_a_moved_state_dir_is_what_gets_purged(self):
+        # Purging the default here would report the data gone and leave it.
+        unit = "ExecStart=/opt/bin/hpc-batchd --state-dir /srv/hpc/state"
+        assert daemon_paths(unit)["state_dir"] == Path("/srv/hpc/state")
+
+    def test_reads_the_form_systemctl_show_prints(self):
+        # `systemctl show -p ExecStart` is the source, not the unit file, so
+        # a drop-in from `systemctl edit` is not missed.
+        shown = (
+            "{ path=/opt/bin/hpc-batchd ; argv[]=/opt/bin/hpc-batchd "
+            "--state-dir /srv/state --socket /run/x/y.sock ; ignore_errors=no }"
+        )
+        paths = daemon_paths(shown)
+        assert paths["state_dir"] == Path("/srv/state")
+        assert paths["socket"] == Path("/run/x/y.sock")
+
+    def test_takes_an_equals_sign_too(self):
+        assert daemon_paths("--dev-dir=/dev/foo")["dev_dir"] == Path("/dev/foo")
+
+
+class TestSafeToRemove:
+    def test_a_data_directory_is_fine(self):
+        assert safe_to_remove(Path("/var/lib/hpc-batch"))
+
+    def test_a_top_level_directory_is_not(self):
+        # These paths come out of a unit file people edit by hand.
+        assert not safe_to_remove(Path("/var"))
+        assert not safe_to_remove(Path("/"))
+
+
+class TestRemoveCgroupTree:
+    def test_removes_the_job_cgroups_and_the_root(self, tmp_path):
+        root = tmp_path / "hpc-batch"
+        (root / "job-1").mkdir(parents=True)
+        (root / "job-2").mkdir()
+        assert remove_cgroup_tree(root) == []
+        assert not root.exists()
+
+    def test_reports_what_is_still_busy_instead_of_claiming_success(self, tmp_path):
+        # A cgroup that will not rmdir still holds processes; saying nothing
+        # would leave jobs running with no daemon left to reap them.
+        root = tmp_path / "hpc-batch"
+        busy = root / "job-1"
+        busy.mkdir(parents=True)
+        (busy / "tasks").write_text("")
+        assert remove_cgroup_tree(root, attempts=1, delay=0) == [busy]
+        assert root.exists()
+
+    def test_a_machine_without_the_tree_has_nothing_to_do(self, tmp_path):
+        assert remove_cgroup_tree(tmp_path / "absent") == []
 
 
 def test_admin_group_candidates_cover_the_common_distros():

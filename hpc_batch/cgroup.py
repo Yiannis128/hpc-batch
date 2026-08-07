@@ -175,9 +175,14 @@ class CgroupManager:
             os.sched_setaffinity(0, cpus)
 
     def kill(self, path: Path) -> None:
-        """SIGKILL every process in the cgroup."""
+        """SIGKILL every process in the cgroup. Absent before kernel 5.14, and
+        the write would create a file rather than do nothing anywhere that is
+        not cgroupfs."""
+        killer = path / "cgroup.kill"
+        if not killer.exists():
+            return
         try:
-            (path / "cgroup.kill").write_text("1")
+            killer.write_text("1")
         except OSError:
             pass
 

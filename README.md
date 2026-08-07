@@ -38,9 +38,8 @@ dispatch list --finished
 Upgrades are `sudo /opt/bin/hpc-batch-install`, which reinstalls and
 *reloads* the daemon rather than restarting it, so running jobs are re-adopted
 instead of losing their exit codes. It rewrites the unit each time, so keep
-local changes in a drop-in (`systemctl edit hpc-batch`). `--uninstall`
-removes everything except `/var/lib/hpc-batch`, so job history and queued
-jobs survive. `hpc-batch-install --help` covers the rest.
+local changes in a drop-in (`systemctl edit hpc-batch`). `hpc-batch-install
+--help` covers the rest.
 
 Where it put things is recorded in `/opt/hpc-batch/install.json`, and later
 runs read it: a bare upgrade repeats the first install's `--bin-dir` and
@@ -53,6 +52,32 @@ own `/etc/profile.d` entry does not end up with the directory listed twice.
 Do **not** install with `sudo pipx`. It puts the entry points in
 `/root/.local/bin` (mode 700), where `hpc-batchd` still works but no other
 user can run the client.
+
+## Uninstall
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Yiannis128/hpc-batch/master/uninstall.sh | sudo sh
+```
+
+That is a bootstrap for `hpc-batch-install --purge`, and it takes the machine
+back to where it started: the daemon is stopped and disabled, the unit, the
+`PATH` entry, the entry points and the virtualenv go, and then so does the
+data. Purging kills any job still running, because `KillMode=process` leaves
+them alive on purpose and after this there is no daemon left to reap them, and
+it deletes `/var/lib/hpc-batch` (queued jobs, history, output not yet
+delivered), `/dev/hpc-batch`, the socket and the job cgroups.
+
+To keep all that, uninstall without purging:
+
+```sh
+sudo /opt/bin/hpc-batch-install --uninstall
+```
+
+Both read `/opt/hpc-batch/install.json` to find the entry points, so an
+install into a non-default `--bin-dir` is cleaned up from where it actually
+went, and both ask systemd for the daemon's command line rather than assume
+the defaults, so a `--state-dir` moved in a drop-in is the one that gets
+purged.
 
 ## Using it
 
