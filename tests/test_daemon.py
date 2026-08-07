@@ -81,6 +81,17 @@ class TestRunAsUser:
         assert "PermissionError" in msg
         assert "/nope" in msg
 
+    @pytest.mark.parametrize("blow_up", [SystemExit(0), KeyboardInterrupt()])
+    def test_what_is_not_an_exception_is_still_a_failure(self, blow_up):
+        # `ok` guarantees the verdict; the broad handler is what still names
+        # the cause instead of reporting a bare "failed".
+        def bail():
+            raise blow_up
+
+        msg = run_as_user(os.getuid(), os.getgid(), "nobody", bail)
+        assert msg is not None
+        assert type(blow_up).__name__ in msg
+
     def test_child_cannot_mutate_the_parent(self, tmp_path):
         # The work happens after a fork, so anything the callback computes is
         # lost. Callers must not rely on side effects, only on the verdict.
