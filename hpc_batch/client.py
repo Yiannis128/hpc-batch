@@ -13,6 +13,7 @@ import sys
 import time
 
 from . import __version__
+from .modify import FIELDS
 from .protocol import DONE, MAX_LINE, OOM, QUEUED, encode, socket_path
 from .resources import GPU_LINK_CHOICES, REMOTE_GPU_LINKS
 from .util import duration_arg, format_duration, format_gb, format_table, format_time
@@ -228,6 +229,21 @@ def cmd_kill(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_job(args: argparse.Namespace) -> int:
+    field = FIELDS[args.field]
+    action = field.actions[args.action]
+    req = {"cmd": "job", "id": args.id, "field": args.field, "action": args.action}
+    if action.mutates:
+        req["value"] = args.value
+    resp = _request(req)
+    value = field.render(resp.get("value"))
+    if action.mutates:
+        print(f"job {args.id} {field.name} {field.render(resp.get('before'))} -> {value}")
+    else:
+        print(f"job {args.id} {field.name} {value}")
+    return 0
+
+
 # -- entry point ---------------------------------------------------------
 
 
@@ -331,6 +347,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_kill.add_argument("id", type=int, help="job id (see 'dispatch list')")
 
+    p_job = sub.add_parser(
+        "job",
+        help="read or change a setting on a job",
+        # No usage= here: argparse derives each subparser's prog from the
+        # parent's usage string when one is set, so it would prefix every
+        # "job <field> <action> --help" with the whole line.
+        description="Read or change one setting on a job. Reading is open to "
+                    "the job's owner and works on finished jobs too; changing "
+                    "a limit is restricted, and only makes sense while the job "
+                    "is still queued or running. Each action says below "
+                    "whether it needs admin.",
+    )
+    p_job.add_argument("id", type=int, help="job id (see 'dispatch list')")
+    # Built from modify.FIELDS so the CLI, the permission gate and the wire
+    # format cannot describe different sets of actions.
+    fields = p_job.add_subparsers(dest="field", required=True, metavar="FIELD")
+    for field in FIELDS.values():
+        p_field = fields.add_parser(field.name, help=field.help, description=field.help)
+        actions = p_field.add_subparsers(dest="action", required=True, metavar="ACTION")
+        for action in field.actions.values():
+            gate = " (admins only)" if action.admin_only else ""
+            p_action = actions.add_parser(
+                action.name, help=action.help + gate, description=action.help + gate,
+            )
+            if action.mutates:
+                p_action.add_argument(
+                    "value", type=field.parse, metavar=field.metavar,
+                    help=field.value_help,
+                )
+
     return parser
 
 
@@ -359,6 +405,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_attach(args)
         if args.command == "kill":
             return cmd_kill(args)
+        if args.command == "job":
+            return cmd_job(args)
     except DispatchError as exc:
         print(f"dispatch: {exc}", file=sys.stderr)
         return 1

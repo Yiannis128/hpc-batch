@@ -468,6 +468,91 @@ class TestSubmit:
         assert daemon.jobs[resp["id"]].numa_local_mem is True
 
 
+class TestJobSettings:
+    """`dispatch job` is gated twice: `_find_job` decides who may touch the
+    job at all, then the action's own flag decides who may change it."""
+
+    def job(self, daemon, job_id=1, field="max-time", action="get", **kw) -> dict:
+        req = {"cmd": "job", "id": job_id, "field": field, "action": action}
+        req.update(kw)
+        return daemon._h_job(req, os.getuid())
+
+    def make(self, tmp_path, *, admin: bool, state=RUNNING) -> Daemon:
+        daemon = make_daemon(tmp_path)
+        daemon.is_admin = lambda uid: admin
+        add_job(daemon, 1, state=state)  # max_time_s=60
+        return daemon
+
+    def test_the_owner_can_read_the_limit(self, tmp_path):
+        resp = self.job(self.make(tmp_path, admin=False))
+        assert resp["ok"] and resp["value"] == 60
+
+    def test_the_owner_cannot_change_it(self, tmp_path):
+        daemon = self.make(tmp_path, admin=False)
+
+        resp = self.job(daemon, action="set", value=120)
+
+        assert not resp["ok"]
+        assert "wheel" in resp["error"]  # the refusal names the group to join
+        assert daemon.jobs[1].max_time_s == 60
+
+    def test_an_admin_can_add_time(self, tmp_path):
+        daemon = self.make(tmp_path, admin=True)
+
+        resp = self.job(daemon, action="add", value=172800)
+
+        assert (resp["before"], resp["value"]) == (60, 172860)
+        assert daemon.jobs[1].max_time_s == 172860
+
+    def test_an_admin_can_set_time(self, tmp_path):
+        daemon = self.make(tmp_path, admin=True)
+        assert self.job(daemon, action="set", value=120)["value"] == 120
+        assert daemon.jobs[1].max_time_s == 120
+
+    def test_a_change_reaches_the_state_file(self, tmp_path):
+        # A new limit that only lives in memory is lost on the next reload,
+        # and the job goes back to being killed at the old one.
+        daemon = self.make(tmp_path, admin=True)
+
+        self.job(daemon, action="add", value=60)
+        daemon._persist(force=True)
+
+        assert '"max_time_s": 120' in daemon.state_file.read_text()
+
+    def test_another_users_job_is_refused_outright(self, tmp_path):
+        daemon = make_daemon(tmp_path)
+        daemon.is_admin = lambda uid: False
+        add_job(daemon, 1, state=RUNNING, uid=os.getuid() + 1)
+
+        assert not self.job(daemon)["ok"]  # not even a read
+
+    def test_a_finished_job_can_be_read_but_not_changed(self, tmp_path):
+        # Reading the limit a job ran under stays useful after it ends;
+        # changing one is meaningless.
+        daemon = self.make(tmp_path, admin=True, state=DONE)
+
+        assert self.job(daemon)["value"] == 60
+        assert not self.job(daemon, action="set", value=120)["ok"]
+
+    def test_an_unknown_field_or_action_names_what_exists(self, tmp_path):
+        daemon = self.make(tmp_path, admin=True)
+
+        assert "max-time" in self.job(daemon, field="max-mem")["error"]
+        assert "get" in self.job(daemon, action="double")["error"]
+
+    def test_a_non_string_field_is_malformed_not_a_crash(self, tmp_path):
+        # dict.get would raise TypeError on an unhashable key, and the client
+        # would be told "internal daemon error" for its own bad request.
+        daemon = self.make(tmp_path, admin=True)
+        assert not self.job(daemon, field=["max-time"])["ok"]
+
+    def test_a_refused_value_leaves_the_job_alone(self, tmp_path):
+        daemon = self.make(tmp_path, admin=True)
+
+        assert not self.job(daemon, action="set", value=0)["ok"]
+        assert daemon.jobs[1].max_time_s == 60
+
+
 class TestList:
     def test_response_carries_the_clock_the_rows_were_built_against(self, tmp_path):
         daemon = make_daemon(tmp_path)
