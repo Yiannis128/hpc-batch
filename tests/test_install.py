@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from hpc_batch import cgroup as cgroup_mod
 from hpc_batch.cgroup import CgroupManager
 from hpc_batch.install import (
     DEFAULT_BIN_DIR,
@@ -305,39 +306,38 @@ class TestKillRunningJobs:
         assert kill_running_jobs(state) == ([], [])
 
 
-class TestPurgeReportsWhatSurvived:
-    def scratch(self, tmp_path) -> tuple[DaemonPaths, CgroupManager]:
-        # Rooted in tmp_path: against the live tree these would kill real jobs.
-        sock = tmp_path / "run" / "s.sock"
-        sock.parent.mkdir(parents=True)
-        sock.touch()
-        paths = DaemonPaths(
-            state_dir=tmp_path / "state", dev_dir=tmp_path / "dev", socket=sock,
-        )
-        return paths, CgroupManager(root=tmp_path / "cgroup")
+@pytest.fixture
+def scratch(tmp_path, monkeypatch) -> DaemonPaths:
+    """Everything purge deletes, rooted in tmp_path. Against the live tree
+    these tests would kill real jobs."""
+    monkeypatch.setattr(cgroup_mod, "CGROUP_FS", tmp_path / "cgroup")
+    # purge builds its own manager, so a patch that stopped working here
+    # would point these tests at the machine's real job tree.
+    assert tmp_path in CgroupManager().root.parents
+    sock = tmp_path / "run" / "s.sock"
+    sock.parent.mkdir(parents=True)
+    sock.touch()
+    return DaemonPaths(state_dir=tmp_path / "state", dev_dir=tmp_path / "dev", socket=sock)
 
-    def test_a_clean_purge_says_so(self, tmp_path, sleeper):
-        paths, cgroups = self.scratch(tmp_path)
-        write_state(paths.state_dir, [job_of(sleeper)])
-        assert purge(paths, cgroups) is True
+
+class TestPurgeReportsWhatSurvived:
+    def test_a_clean_purge_says_so(self, scratch, sleeper):
+        write_state(scratch.state_dir, [job_of(sleeper)])
+        assert purge(scratch) is True
         assert sleeper.wait(timeout=5) == -signal.SIGKILL
 
-    def test_an_unidentifiable_job_makes_the_purge_incomplete(self, tmp_path, sleeper, capsys):
+    def test_an_unidentifiable_job_makes_the_purge_incomplete(self, scratch, sleeper, capsys):
         # The whole point: the state dir is deleted either way, so a purge
         # that could not kill a job must not report the machine clean.
-        paths, cgroups = self.scratch(tmp_path)
-        write_state(paths.state_dir, [job_of(sleeper, proc_start=None)])
-        assert purge(paths, cgroups) is False
+        write_state(scratch.state_dir, [job_of(sleeper, proc_start=None)])
+        assert purge(scratch) is False
         assert "may still be running" in capsys.readouterr().out
         assert sleeper.poll() is None
 
-    def test_a_refused_path_makes_the_purge_incomplete(self, tmp_path):
-        paths, cgroups = self.scratch(tmp_path)
-        assert purge(paths._replace(state_dir=Path("/var")), cgroups) is False
+    def test_a_refused_path_makes_the_purge_incomplete(self, scratch):
+        assert purge(scratch._replace(state_dir=Path("/var"))) is False
 
     def test_an_incomplete_purge_exits_non_zero(self, monkeypatch):
-        # uninstall.sh execs the installer under `set -eu`, so this status is
-        # what a curl-pipe-sh teardown reports.
         monkeypatch.setattr("hpc_batch.install.uninstall", lambda args: False)
         with pytest.raises(SystemExit) as caught:
             main(["--purge"])
