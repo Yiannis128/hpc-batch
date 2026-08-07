@@ -66,11 +66,14 @@ def split_assignments(command: list[str]) -> tuple[dict[str, str], list[str]]:
     `./x=y` and `/usr/bin/x=y` stay part of the command.
     """
     env: dict[str, str] = {}
-    rest = list(command)
-    while rest and _ASSIGNMENT.match(rest[0]):
-        name, _, value = rest.pop(0).partition("=")
+    split = 0
+    for word in command:
+        if not _ASSIGNMENT.match(word):
+            break
+        name, _, value = word.partition("=")
         env[name] = value
-    return env, rest
+        split += 1
+    return env, command[split:]
 
 
 def format_duration(seconds: float | None) -> str:

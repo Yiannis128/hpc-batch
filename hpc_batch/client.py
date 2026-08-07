@@ -84,8 +84,6 @@ def cmd_new(args: argparse.Namespace, command: list[str], job_env: dict[str, str
         "numa_local_mem": args.numa_local or args.numa_local_mem,
         "numa_local_gpu": args.numa_local or args.numa_local_gpu,
         "min_gpu_link": args.gpu_link,
-        # Named on the command line last, so an explicit assignment beats a
-        # variable of the same name swept up by --env.
         "env": (dict(os.environ) if args.env else {}) | job_env,
         "output": output,
     }
@@ -255,6 +253,8 @@ def cmd_job(args: argparse.Namespace) -> int:
 
 # -- entry point ---------------------------------------------------------
 
+NEW_USAGE = "dispatch new [options] -- [NAME=VALUE...] <command> [args...]"
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -267,7 +267,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_new = sub.add_parser(
         "new",
         help="submit a job",
-        usage="dispatch new [options] -- <command> [args...]",
+        usage=NEW_USAGE,
         description="Submit a job to the FIFO queue. Everything after '--' is "
                     "executed as your user once the requested resources are free, "
                     "with any leading NAME=VALUE words taken as environment, as "
@@ -410,7 +410,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "new":
             if not command:
-                parser.error("no command given; usage: dispatch new [options] -- <command>")
+                parser.error(f"no command given; usage: {NEW_USAGE}")
             return cmd_new(args, command, job_env)
         if args.command == "list":
             return cmd_list(args)
