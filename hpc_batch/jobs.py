@@ -90,20 +90,23 @@ class Job:
 
     def attach_process(self, pid: int) -> None:
         """Record the process this job is now running as. Both fields or
-        neither: without the starttime, `still_alive` can only answer no."""
+        neither: without the starttime, the job is not identifiable."""
         self.pid = pid
         self.proc_start = proc_starttime(pid)
+
+    def identifiable(self) -> bool:
+        """Whether pid and starttime were both recorded. False means "cannot
+        say", not "gone" -- a caller that kills on the answer must report it."""
+        return self.pid is not None and self.proc_start is not None
 
     def still_alive(self) -> bool:
         """Whether the recorded pid is still this job's process.
 
-        Asked of `/proc`, so it answers with no daemon at all. A state file
-        too old to carry a starttime answers no rather than guessing:
-        callers SIGKILL a process group on this.
+        Asked of `/proc`, so it answers with no daemon at all. An
+        unidentifiable job answers no rather than guessing: callers SIGKILL
+        a process group on this.
         """
-        if self.pid is None or self.proc_start is None:
-            return False
-        return proc_starttime(self.pid) == self.proc_start
+        return self.identifiable() and proc_starttime(self.pid) == self.proc_start
 
     def request(self) -> Request:
         """What this job is asking the pool for."""

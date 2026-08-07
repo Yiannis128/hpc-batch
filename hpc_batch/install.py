@@ -225,62 +225,99 @@ def _rmdir_if_empty(path: Path) -> None:
         pass
 
 
-def _remove_data(path: Path, what: str) -> None:
+def _remove_data(path: Path, what: str) -> str | None:
+    """Delete a directory the daemon owns; returns what stopped it, or None."""
     if not path.exists():
-        return
+        return None
     if not safe_to_remove(path):
-        print(f"warning: refusing to remove {path} ({what}): too close to /")
-        return
+        return f"refusing to remove {path} ({what}): too close to /"
     shutil.rmtree(path, ignore_errors=True)
     # rmtree swallowed whatever went wrong, so look rather than announce.
     if path.exists():
-        print(f"warning: could not fully remove {path} ({what})")
-    else:
-        print(f"removed {path} ({what})")
+        return f"could not fully remove {path} ({what})"
+    print(f"removed {path} ({what})")
+    return None
 
 
-def kill_running_jobs(state_dir: Path) -> list[int]:
+class KillOutcome(NamedTuple):
+    killed: list[int]
+    unverified: list[int]
+
+
+def kill_running_jobs(state_dir: Path) -> KillOutcome:
     """SIGKILL the process group of every job state.json says is running.
 
     Under --no-cgroups there is no tree to walk, so these pids are the only
-    handle on the jobs. Returns the ids actually killed.
+    handle on the jobs. `unverified` is what may still be running: no
+    recorded identity, or a refused kill. A job that had already ended is in
+    neither list.
     """
     try:
         _, jobs = read_state(state_dir)
     except StateError:
-        return []  # a corrupt state file is one of the things a purge cleans up
-    killed = []
+        return KillOutcome([], [])  # a corrupt state file is itself something purge cleans up
+    killed, unverified = [], []
     for job in jobs:
-        if job.state != RUNNING or not job.still_alive():
+        if job.state != RUNNING:
+            continue
+        if not job.identifiable():
+            unverified.append(job.id)
+            continue
+        if not job.still_alive():
             continue
         try:
             os.killpg(job.pid, signal.SIGKILL)
+            killed.append(job.id)
+        except ProcessLookupError:
+            pass  # raced us and exited
         except OSError:
-            continue  # already gone, or not ours to kill
-        killed.append(job.id)
-    return killed
+            unverified.append(job.id)  # there, and not ours to kill
+    return KillOutcome(killed, unverified)
 
 
-def purge(paths: DaemonPaths) -> None:
+def purge(paths: DaemonPaths) -> bool:
     """Remove everything the daemon owns at runtime: running jobs, the state
-    directory, the inspection entries and the socket."""
-    killed = kill_running_jobs(paths.state_dir)
+    directory, the inspection entries and the socket.
+
+    False when any of it survived. Purge destroys its own evidence: once the
+    state directory is gone, a job it failed to kill is still running with
+    nothing left on disk recording that it exists.
+    """
+    survived: list[str] = []
+
+    def warn(message: str) -> None:
+        """The only way to report a problem, so that reporting one and
+        marking the purge incomplete cannot come apart."""
+        print(f"warning: {message}")
+        survived.append(message)
+
+    killed, unverified = kill_running_jobs(paths.state_dir)
     if killed:
         print(f"killed running jobs: {', '.join(str(i) for i in killed)}")
+    if unverified:
+        listed = ", ".join(str(i) for i in unverified)
+        warn(f"job(s) {listed} may still be running: no recorded identity, "
+             f"or the kill was refused")
 
     cgroups = CgroupManager()
     busy = cgroups.destroy()
     if busy:
         listed = ", ".join(p.name for p in busy)
-        print(f"warning: could not remove {cgroups.root}: {listed} still busy")
+        warn(f"could not remove {cgroups.root}: {listed} still busy")
     elif cgroups.root.exists():
-        print(f"warning: {cgroups.root} is still there")
+        warn(f"{cgroups.root} is still there")
 
-    _remove_data(paths.state_dir, "job state and output")
-    _remove_data(paths.dev_dir, "job inspection entries")
+    for path, what in ((paths.state_dir, "job state and output"),
+                       (paths.dev_dir, "job inspection entries")):
+        if problem := _remove_data(path, what):
+            warn(problem)
 
-    paths.socket.unlink(missing_ok=True)
+    try:
+        paths.socket.unlink(missing_ok=True)
+    except OSError as exc:
+        warn(f"could not remove the socket {paths.socket} ({exc})")
     _rmdir_if_empty(paths.socket.parent)
+    return not survived
 
 
 def unit_template() -> str:
@@ -382,7 +419,8 @@ def install(args: argparse.Namespace) -> None:
     print("verify with: systemctl status hpc-batch && dispatch list")
 
 
-def uninstall(args: argparse.Namespace) -> None:
+def uninstall(args: argparse.Namespace) -> bool:
+    """False when --purge left something behind."""
     _check_preconditions()
     bin_dirs = bin_dirs_to_clean(read_record(args.prefix), args.bin_dir)
     # While the unit is still there to be asked; --purge deletes what it says.
@@ -401,13 +439,18 @@ def uninstall(args: argparse.Namespace) -> None:
     listed = ", ".join(str(d) for d in sorted(bin_dirs))
     print(f"removed {args.prefix} and the entry points in {listed}")
 
-    if args.purge:
-        purge(paths)
-        print("purged: no job history, queued jobs or undelivered output left")
-    else:
+    if not args.purge:
         print(f"left {paths.state_dir} alone: it holds job history and "
               f"queued jobs, and jobs still running were not killed")
         print("pass --purge to remove those too")
+        return True
+
+    if purge(paths):
+        print("purged: no job history, queued jobs or undelivered output left")
+        return True
+    print("purge incomplete: see the warnings above; something the daemon "
+          "owned is still on this machine")
+    return False
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -454,7 +497,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     try:
-        uninstall(args) if args.uninstall or args.purge else install(args)
+        if args.uninstall or args.purge:
+            if not uninstall(args):
+                sys.exit(2)  # distinct from 1: we ran, the machine is not clean
+        else:
+            install(args)
     except InstallError as exc:
         print(f"hpc-batch-install: {exc}", file=sys.stderr)
         sys.exit(1)
