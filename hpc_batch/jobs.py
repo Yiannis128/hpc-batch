@@ -88,19 +88,21 @@ class Job:
         start = self.start_time if self.start_time is not None else now
         return start + self.max_time_s
 
+    def identifiable(self) -> bool:
+        """Whether pid and starttime were both recorded. False means "cannot
+        say", not "gone" -- a caller that kills on the answer must report it."""
+        return self.pid is not None and self.proc_start is not None
+
     def still_alive(self) -> bool:
         """Whether the recorded pid is still this job's process.
 
         Asked of `/proc` rather than of our children, so it also answers for
         a daemon that was fully restarted -- and for the installer, with no
         daemon at all. starttime is what makes it safe: a recycled pid is a
-        different process, and a state file too old to carry one cannot be
-        checked, so it answers no rather than guessing. Callers SIGKILL a
-        process group on the strength of this.
+        different process. Unidentifiable jobs answer no rather than guessing,
+        since callers SIGKILL a process group on the strength of this.
         """
-        if self.pid is None or self.proc_start is None:
-            return False
-        return proc_starttime(self.pid) == self.proc_start
+        return self.identifiable() and proc_starttime(self.pid) == self.proc_start
 
     def request(self) -> Request:
         """What this job is asking the pool for."""

@@ -67,6 +67,11 @@ them alive on purpose and after this there is no daemon left to reap them, and
 it deletes `/var/lib/hpc-batch` (queued jobs, history, output not yet
 delivered), `/dev/hpc-batch`, the socket and the job cgroups.
 
+A job it cannot account for is left alone rather than killed on a pid it
+could not confirm, and then named: purging says what survived and exits 2
+instead of claiming a clean machine, which is what you get from the pipe
+above as well.
+
 To keep all that, uninstall without purging:
 
 ```sh

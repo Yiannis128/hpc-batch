@@ -12,15 +12,19 @@ from pathlib import Path
 
 import pytest
 
+from hpc_batch.cgroup import CgroupManager
 from hpc_batch.install import (
     DEFAULT_BIN_DIR,
+    DaemonPaths,
     InstallError,
     bin_dirs_to_clean,
     daemon_paths,
     detect_admin_group,
     kill_running_jobs,
     login_path_provides,
+    main,
     profile_snippet,
+    purge,
     read_record,
     render_unit,
     safe_to_remove,
@@ -28,7 +32,6 @@ from hpc_batch.install import (
     unit_template,
     write_record,
 )
-from hpc_batch.cgroup import CgroupManager
 from hpc_batch.jobs import DONE, QUEUED, RUNNING, STATE_FILE_NAME, Job, proc_starttime
 from hpc_batch.util import ADMIN_GROUPS
 from test_jobs import make_job
@@ -267,30 +270,32 @@ class TestKillRunningJobs:
         # so these pids are the only handle on a running job. Purge used to
         # delete the state dir and report success while the job kept running.
         state = write_state(tmp_path / "state", [job_of(sleeper)])
-        assert kill_running_jobs(state) == [1]
+        assert kill_running_jobs(state) == ([1], [])
         assert sleeper.wait(timeout=5) == -signal.SIGKILL
 
-    def test_a_recycled_pid_is_not_killed(self, tmp_path, sleeper):
+    def test_a_recycled_pid_is_not_killed_and_is_not_a_warning(self, tmp_path, sleeper):
         # The daemon may have died days ago and the pid now belong to
-        # something with nothing to do with us.
+        # something with nothing to do with us. That job ended: nothing to
+        # kill and nothing to report.
         job = job_of(sleeper, proc_start=proc_starttime(sleeper.pid) + 1)
-        assert kill_running_jobs(write_state(tmp_path / "state", [job])) == []
+        assert kill_running_jobs(write_state(tmp_path / "state", [job])) == ([], [])
         assert sleeper.poll() is None
 
-    def test_a_job_with_no_recorded_starttime_is_not_killed(self, tmp_path, sleeper):
-        # An older state file cannot prove the pid is still the job's, and an
-        # unverified killpg is somebody else's process group.
+    def test_a_job_with_no_recorded_starttime_is_reported_not_killed(self, tmp_path, sleeper):
+        # Nothing proves the pid is still the job's, and an unverified killpg
+        # is somebody else's process group -- but staying quiet would let the
+        # caller announce a clean machine over a job that is still running.
         job = job_of(sleeper, proc_start=None)
-        assert kill_running_jobs(write_state(tmp_path / "state", [job])) == []
+        assert kill_running_jobs(write_state(tmp_path / "state", [job])) == ([], [1])
         assert sleeper.poll() is None
 
     def test_finished_and_queued_jobs_are_left_alone(self, tmp_path, sleeper):
         jobs = [job_of(sleeper, id=1, state=DONE), job_of(sleeper, id=2, state=QUEUED, pid=None)]
-        assert kill_running_jobs(write_state(tmp_path / "state", jobs)) == []
+        assert kill_running_jobs(write_state(tmp_path / "state", jobs)) == ([], [])
         assert sleeper.poll() is None
 
     def test_no_state_file_is_not_an_error(self, tmp_path):
-        assert kill_running_jobs(tmp_path / "absent") == []
+        assert kill_running_jobs(tmp_path / "absent") == ([], [])
 
     @pytest.mark.parametrize("text", ["{ this is not json", "[1, 2, 3]", "null"])
     def test_unreadable_state_is_not_an_error(self, tmp_path, text):
@@ -299,7 +304,50 @@ class TestKillRunningJobs:
         state = tmp_path / "state"
         state.mkdir()
         (state / STATE_FILE_NAME).write_text(text)
-        assert kill_running_jobs(state) == []
+        assert kill_running_jobs(state) == ([], [])
+
+
+class TestPurgeReportsWhatSurvived:
+    def scratch(self, tmp_path) -> tuple[DaemonPaths, CgroupManager]:
+        # Rooted in tmp_path: against the live tree these would kill real jobs.
+        sock = tmp_path / "run" / "s.sock"
+        sock.parent.mkdir(parents=True)
+        sock.touch()
+        paths = DaemonPaths(
+            state_dir=tmp_path / "state", dev_dir=tmp_path / "dev", socket=sock,
+        )
+        return paths, CgroupManager(root=tmp_path / "cgroup")
+
+    def test_a_clean_purge_says_so(self, tmp_path, sleeper):
+        paths, cgroups = self.scratch(tmp_path)
+        write_state(paths.state_dir, [job_of(sleeper)])
+        assert purge(paths, cgroups) is True
+        assert sleeper.wait(timeout=5) == -signal.SIGKILL
+
+    def test_an_unidentifiable_job_makes_the_purge_incomplete(self, tmp_path, sleeper, capsys):
+        # The whole point: the state dir is deleted either way, so a purge
+        # that could not kill a job must not report the machine clean.
+        paths, cgroups = self.scratch(tmp_path)
+        write_state(paths.state_dir, [job_of(sleeper, proc_start=None)])
+        assert purge(paths, cgroups) is False
+        assert "may still be running" in capsys.readouterr().out
+        assert sleeper.poll() is None
+
+    def test_a_refused_path_makes_the_purge_incomplete(self, tmp_path):
+        paths, cgroups = self.scratch(tmp_path)
+        assert purge(paths._replace(state_dir=Path("/var")), cgroups) is False
+
+    def test_an_incomplete_purge_exits_non_zero(self, monkeypatch):
+        # uninstall.sh execs the installer under `set -eu`, so this status is
+        # what a curl-pipe-sh teardown reports.
+        monkeypatch.setattr("hpc_batch.install.uninstall", lambda args: False)
+        with pytest.raises(SystemExit) as caught:
+            main(["--purge"])
+        assert caught.value.code == 2
+
+    def test_a_clean_purge_exits_zero(self, monkeypatch):
+        monkeypatch.setattr("hpc_batch.install.uninstall", lambda args: True)
+        assert main(["--purge"]) is None
 
 
 class TestSafeToRemove:
