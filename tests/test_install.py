@@ -12,6 +12,7 @@ import pytest
 from hpc_batch.install import (
     DEFAULT_BIN_DIR,
     InstallError,
+    bin_dirs_to_clean,
     detect_admin_group,
     login_path_provides,
     profile_snippet,
@@ -156,28 +157,53 @@ class TestSettle:
         # The bug this exists for: a bare upgrade linking into the default
         # bin dir and leaving the first install's symlinks unmanaged.
         record = {"bin_dir": "/usr/local/bin"}
-        assert settle(record, "bin_dir", "--bin-dir", None) == "/usr/local/bin"
+        assert settle(record, "bin_dir", None) == "/usr/local/bin"
 
     def test_the_same_value_passed_again_is_not_a_disagreement(self):
         record = {"bin_dir": "/usr/local/bin"}
-        assert settle(record, "bin_dir", "--bin-dir", Path("/usr/local/bin")) == "/usr/local/bin"
+        assert settle(record, "bin_dir", Path("/usr/local/bin")) == "/usr/local/bin"
 
     def test_a_different_value_refuses_and_names_both(self):
         record = {"bin_dir": "/usr/local/bin"}
         with pytest.raises(InstallError) as caught:
-            settle(record, "bin_dir", "--bin-dir", Path("/opt/bin"))
+            settle(record, "bin_dir", Path("/opt/bin"))
         message = str(caught.value)
         assert "--bin-dir" in message
         assert "/usr/local/bin" in message and "/opt/bin" in message
         assert "--uninstall" in message
 
+    def test_the_refusal_names_the_flag_the_key_belongs_to(self):
+        # Derived rather than passed, so a third option cannot be wired up
+        # with a key and a flag that disagree.
+        with pytest.raises(InstallError) as caught:
+            settle({"admin_group": "sudo"}, "admin_group", "wheel")
+        assert "--admin-group" in str(caught.value)
+
     def test_nothing_remembered_leaves_the_caller_its_default(self):
-        assert settle({}, "bin_dir", "--bin-dir", None) is None
+        assert settle({}, "bin_dir", None) is None
 
     def test_a_group_that_appeared_later_does_not_take_over(self):
         # detect_admin_group() would now answer wheel on a box that has since
         # grown one, quietly moving admin control off sudo.
-        assert settle({"admin_group": "sudo"}, "admin_group", "--admin-group", None) == "sudo"
+        assert settle({"admin_group": "sudo"}, "admin_group", None) == "sudo"
+
+
+class TestBinDirsToClean:
+    def test_the_record_wins_over_the_default(self):
+        # Cleaning /opt/bin because that is the default would leave the real
+        # entry points dangling into a prefix uninstall just deleted.
+        record = {"bin_dir": "/usr/local/bin"}
+        assert bin_dirs_to_clean(record, None) == {Path("/usr/local/bin")}
+
+    def test_an_explicit_dir_adds_to_the_recorded_one(self):
+        record = {"bin_dir": "/usr/local/bin"}
+        assert bin_dirs_to_clean(record, Path("/opt/bin")) == {
+            Path("/usr/local/bin"),
+            Path("/opt/bin"),
+        }
+
+    def test_no_record_falls_back_to_the_default(self):
+        assert bin_dirs_to_clean({}, None) == {DEFAULT_BIN_DIR}
 
 
 def test_admin_group_candidates_cover_the_common_distros():

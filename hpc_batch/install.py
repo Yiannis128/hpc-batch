@@ -126,27 +126,21 @@ def read_record(prefix: Path) -> dict:
 
 def write_record(prefix: Path, bin_dir: Path, admin_group: str) -> None:
     (prefix / RECORD_NAME).write_text(
-        json.dumps(
-            {
-                "version": __version__,
-                "bin_dir": str(bin_dir),
-                "admin_group": admin_group,
-            },
-            indent=2,
-        )
-        + "\n"
+        json.dumps({"bin_dir": str(bin_dir), "admin_group": admin_group}, indent=2) + "\n"
     )
 
 
-def settle(record: dict, key: str, flag: str, given: str | Path | None) -> str | None:
+def settle(record: dict, key: str, given: str | Path | None) -> str | None:
     """Reconcile one option against the last install of this prefix.
 
     Not passing the flag means "whatever last time did", so a bare upgrade
     cannot quietly move the entry points and leave the old ones behind, and
     an admin group that only appeared on the box later cannot silently take
     over. Passing something else is a refusal rather than a migration: the
-    old install is still on disk and nothing here would move it.
+    old install is still on disk and nothing here would move it. The flag
+    name is derived from the key so a refusal cannot name the wrong option.
     """
+    flag = "--" + key.replace("_", "-")
     remembered = record.get(key)
     if given is None:
         return remembered
@@ -157,6 +151,19 @@ def settle(record: dict, key: str, flag: str, given: str | Path | None) -> str |
             f"'hpc-batch-install --uninstall' first and install again"
         )
     return str(given)
+
+
+def bin_dirs_to_clean(record: dict, given: Path | None) -> set[Path]:
+    """Everywhere uninstall should look for entry points.
+
+    A union rather than a settlement: cleanup wants every place a symlink
+    might be, and refusing a --bin-dir that disagrees with the record would
+    leave behind exactly the split install it was passed to sweep up.
+    """
+    dirs = {Path(record["bin_dir"])} if record.get("bin_dir") else set()
+    if given:
+        dirs.add(given)
+    return dirs or {DEFAULT_BIN_DIR}
 
 
 def unit_template() -> str:
@@ -205,9 +212,8 @@ def _make_venv(prefix: Path) -> Path:
 def install(args: argparse.Namespace) -> None:
     _check_preconditions()
     record = read_record(args.prefix)
-    bin_dir = Path(settle(record, "bin_dir", "--bin-dir", args.bin_dir) or DEFAULT_BIN_DIR)
-    admin_group = settle(record, "admin_group", "--admin-group", args.admin_group)
-    admin_group = admin_group or detect_admin_group()
+    bin_dir = Path(settle(record, "bin_dir", args.bin_dir) or DEFAULT_BIN_DIR)
+    admin_group = settle(record, "admin_group", args.admin_group) or detect_admin_group()
 
     if not args.already_installed:
         pip = _make_venv(args.prefix)
@@ -228,11 +234,10 @@ def install(args: argparse.Namespace) -> None:
         PROFILE_PATH.write_text(profile_snippet(bin_dir))
         PROFILE_PATH.chmod(0o644)
         print(f"wrote {PROFILE_PATH} (login shells pick it up; this one will not)")
-    elif PROFILE_PATH.exists():
-        PROFILE_PATH.unlink()
-        print(f"removed {PROFILE_PATH}: {provider} already puts {bin_dir} on PATH")
     else:
-        print(f"skipped {PROFILE_PATH}: {provider} already puts {bin_dir} on PATH")
+        verb = "removed" if PROFILE_PATH.exists() else "skipped"
+        PROFILE_PATH.unlink(missing_ok=True)
+        print(f"{verb} {PROFILE_PATH}: {provider} already puts {bin_dir} on PATH")
 
     unit = render_unit(unit_template(), bin_dir / "hpc-batchd", admin_group)
     UNIT_PATH.write_text(unit)
@@ -262,14 +267,7 @@ def install(args: argparse.Namespace) -> None:
 
 def uninstall(args: argparse.Namespace) -> None:
     _check_preconditions()
-    # Otherwise an install that chose its own --bin-dir leaves dangling
-    # symlinks into the prefix we are about to delete. --bin-dir adds a
-    # location to clean rather than replacing the recorded one.
-    record = read_record(args.prefix)
-    bin_dirs = {Path(record["bin_dir"])} if record.get("bin_dir") else set()
-    if args.bin_dir or not bin_dirs:
-        bin_dirs.add(args.bin_dir or DEFAULT_BIN_DIR)
-
+    bin_dirs = bin_dirs_to_clean(read_record(args.prefix), args.bin_dir)
     subprocess.run(["systemctl", "disable", "--now", "hpc-batch"], check=False)
     for path in (UNIT_PATH, PROFILE_PATH):
         path.unlink(missing_ok=True)
