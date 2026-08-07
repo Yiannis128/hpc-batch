@@ -8,6 +8,7 @@ import time
 
 _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 _DURATION_RE = re.compile(r"(\d+)([smhd])")
+_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 
 # Distro-dependent, and getting it wrong means nobody but root is an admin.
 # The installer picks the first that exists; the daemon suggests them when
@@ -48,6 +49,20 @@ def duration_arg(text: str) -> int:
         return parse_duration(text)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from None
+
+
+def split_assignments(command: list[str]) -> tuple[dict[str, str], list[str]]:
+    """Peel leading NAME=VALUE words off a command, the way `env(1)` reads them.
+
+    A name has to start with a letter or underscore, so a path never matches:
+    `./x=y` and `/usr/bin/x=y` stay part of the command.
+    """
+    env: dict[str, str] = {}
+    rest = list(command)
+    while rest and _ASSIGNMENT.match(rest[0]):
+        name, _, value = rest.pop(0).partition("=")
+        env[name] = value
+    return env, rest
 
 
 def format_duration(seconds: float | None) -> str:
