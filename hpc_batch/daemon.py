@@ -65,6 +65,11 @@ from .util import ADMIN_GROUPS, duration_arg, format_duration, format_gb, group_
 
 log = logging.getLogger("hpc-batchd")
 
+# Where the daemon keeps its data. Named here rather than only in parse_args
+# because the installer's --purge has to delete exactly these.
+DEFAULT_STATE_DIR = Path("/var/lib/hpc-batch")
+DEFAULT_DEV_DIR = Path("/dev/hpc-batch")
+
 TICK_S = 1.0
 KILL_GRACE_S = 10.0
 ATTACH_POLL_S = 0.3
@@ -1145,12 +1150,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help=f"unix socket to listen on (default: {DEFAULT_SOCKET})",
     )
     parser.add_argument(
-        "--state-dir", type=Path, default=Path("/var/lib/hpc-batch"), metavar="DIR",
-        help="where job state and output live (default: /var/lib/hpc-batch)",
+        "--state-dir", type=Path, default=DEFAULT_STATE_DIR, metavar="DIR",
+        help=f"where job state and output live (default: {DEFAULT_STATE_DIR})",
     )
     parser.add_argument(
-        "--dev-dir", type=Path, default=Path("/dev/hpc-batch"), metavar="DIR",
-        help="where job inspection entries appear (default: /dev/hpc-batch)",
+        "--dev-dir", type=Path, default=DEFAULT_DEV_DIR, metavar="DIR",
+        help=f"where job inspection entries appear (default: {DEFAULT_DEV_DIR})",
     )
     parser.add_argument(
         "--keep-finished", type=int, default=50, metavar="N",

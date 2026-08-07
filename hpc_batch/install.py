@@ -24,9 +24,13 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from . import __version__
+from .cgroup import CGROUP_FS, CgroupManager
+from .daemon import DEFAULT_DEV_DIR, DEFAULT_STATE_DIR
+from .protocol import DEFAULT_SOCKET
 from .util import ADMIN_GROUPS, group_exists
 
 DEFAULT_PREFIX = Path("/opt/hpc-batch")
@@ -34,10 +38,12 @@ DEFAULT_BIN_DIR = Path("/opt/bin")
 UNIT_PATH = Path("/etc/systemd/system/hpc-batch.service")
 PROFILE_PATH = Path("/etc/profile.d/hpc-batch.sh")
 ETC = Path("/etc")
+CGROUP_ROOT = CGROUP_FS / "hpc-batch"
 RECORD_NAME = "install.json"
 ENTRY_POINTS = ("dispatch", "hpc-batchd", "hpc-batch-install")
 
 _PATH_ASSIGNMENT = re.compile(r"\bPATH\s*=")
+_DIR_FLAG = re.compile(r"--(state-dir|dev-dir|socket)[=\s]+(\S+)")
 
 
 class InstallError(Exception):
@@ -166,6 +172,101 @@ def bin_dirs_to_clean(record: dict, given: Path | None) -> set[Path]:
     return dirs or {DEFAULT_BIN_DIR}
 
 
+def daemon_paths(exec_start: str) -> dict[str, Path]:
+    """Where the daemon actually keeps its data.
+
+    Read off its command line rather than assumed, because --state-dir and
+    --dev-dir are exactly the sort of thing an admin moves: a purge that
+    deletes the defaults would report the data gone while leaving it on disk.
+    """
+    found = {m.group(1): Path(m.group(2)) for m in _DIR_FLAG.finditer(exec_start)}
+    return {
+        "state_dir": found.get("state-dir", DEFAULT_STATE_DIR),
+        "dev_dir": found.get("dev-dir", DEFAULT_DEV_DIR),
+        "socket": found.get("socket", Path(DEFAULT_SOCKET)),
+    }
+
+
+def daemon_exec_start() -> str:
+    """The daemon's command line as systemd will run it, drop-ins included.
+
+    Ask systemd rather than read the unit: `systemctl edit` is the documented
+    way to change a flag here, and the file we wrote knows nothing about it.
+    Only valid before the unit is removed.
+    """
+    shown = subprocess.run(
+        ["systemctl", "show", "hpc-batch", "--property=ExecStart", "--value"],
+        capture_output=True, text=True, check=False,
+    )
+    if shown.returncode == 0 and shown.stdout.strip():
+        return shown.stdout
+    try:
+        return UNIT_PATH.read_text()
+    except OSError:
+        return ""
+
+
+def safe_to_remove(path: Path) -> bool:
+    """Guard on paths that arrive from a hand-edited unit file: /var/lib/x is
+    a data directory, /var is somebody's whole machine."""
+    return path.is_absolute() and len(path.parts) > 2
+
+
+def _rmdir_if_empty(path: Path) -> None:
+    try:
+        path.rmdir()
+    except OSError:
+        pass
+
+
+def remove_cgroup_tree(root: Path, attempts: int = 20, delay: float = 0.1) -> list[Path]:
+    """Kill whatever is still in the job cgroups and take the tree down.
+
+    Stopping the unit does not do this: KillMode=process leaves jobs running
+    on purpose so a restart can re-adopt them, and after an uninstall nothing
+    ever comes back to reap them. Returns the cgroups still busy at the end --
+    SIGKILL is not instant, and claiming success without looking is a guess.
+    """
+    if not root.is_dir():
+        return []
+    manager = CgroupManager(root=root)
+    pending = sorted(root.glob("job-*"))
+    for _ in range(attempts):
+        pending = [path for path in pending if not manager.try_remove(path)]
+        if not pending:
+            break
+        time.sleep(delay)
+    if not pending:
+        _rmdir_if_empty(root)
+    return pending
+
+
+def purge(paths: dict[str, Path]) -> None:
+    """Remove everything the daemon owns at runtime: running jobs, the state
+    directory, the inspection entries and the socket."""
+    busy = remove_cgroup_tree(CGROUP_ROOT)
+    if busy:
+        listed = ", ".join(p.name for p in busy)
+        print(f"warning: could not remove {CGROUP_ROOT}: {listed} still busy")
+    elif CGROUP_ROOT.exists():
+        print(f"warning: {CGROUP_ROOT} is still there")
+
+    for key, what in (("state_dir", "job state and output"),
+                      ("dev_dir", "job inspection entries")):
+        path = paths[key]
+        if not path.exists():
+            continue
+        if not safe_to_remove(path):
+            print(f"warning: refusing to remove {path} ({what}): too close to /")
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        print(f"removed {path} ({what})")
+
+    socket = paths["socket"]
+    socket.unlink(missing_ok=True)
+    _rmdir_if_empty(socket.parent)
+
+
 def unit_template() -> str:
     path = Path(__file__).with_name("data") / "hpc-batch.service"
     try:
@@ -268,6 +369,9 @@ def install(args: argparse.Namespace) -> None:
 def uninstall(args: argparse.Namespace) -> None:
     _check_preconditions()
     bin_dirs = bin_dirs_to_clean(read_record(args.prefix), args.bin_dir)
+    # While the unit is still there to be asked; --purge deletes what it says.
+    paths = daemon_paths(daemon_exec_start())
+
     subprocess.run(["systemctl", "disable", "--now", "hpc-batch"], check=False)
     for path in (UNIT_PATH, PROFILE_PATH):
         path.unlink(missing_ok=True)
@@ -275,11 +379,19 @@ def uninstall(args: argparse.Namespace) -> None:
     for bin_dir in sorted(bin_dirs):
         for name in ENTRY_POINTS:
             (bin_dir / name).unlink(missing_ok=True)
+        _rmdir_if_empty(bin_dir)
     shutil.rmtree(args.prefix, ignore_errors=True)
     _run(["systemctl", "daemon-reload"], "reload the systemd manager")
     listed = ", ".join(str(d) for d in sorted(bin_dirs))
     print(f"removed {args.prefix} and the entry points in {listed}")
-    print("left /var/lib/hpc-batch alone: it holds job history and queued jobs")
+
+    if args.purge:
+        purge(paths)
+        print("purged: no job history, queued jobs or undelivered output left")
+    else:
+        print(f"left {paths['state_dir']} alone: it holds job history and "
+              f"queued jobs, and jobs still running were not killed")
+        print("pass --purge to remove those too")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -313,6 +425,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--uninstall", action="store_true",
                         help="remove the unit, the entry points and the "
                              "virtualenv, keeping job state")
+    parser.add_argument("--purge", action="store_true",
+                        help="uninstall, and also kill any job still running "
+                             "and delete the daemon's data: the state "
+                             "directory (queued jobs, history, output not yet "
+                             "delivered), the inspection entries, the socket "
+                             "and the job cgroups")
     parser.add_argument("--version", action="version", version=f"hpc-batch {__version__}")
     return parser.parse_args(argv)
 
@@ -320,7 +438,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     try:
-        uninstall(args) if args.uninstall else install(args)
+        uninstall(args) if args.uninstall or args.purge else install(args)
     except InstallError as exc:
         print(f"hpc-batch-install: {exc}", file=sys.stderr)
         sys.exit(1)
