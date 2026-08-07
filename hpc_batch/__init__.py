@@ -1,3 +1,3 @@
 """hpc-batch: single-node FIFO batch job dispatcher with cgroup + NUMA isolation."""
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
