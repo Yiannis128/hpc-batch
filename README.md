@@ -143,8 +143,10 @@ uid and gid. Each job gets its own cgroup with `cpuset.cpus`, `cpuset.mems`
 and `memory.max` applied, living outside the daemon's own service cgroup so
 restarting the unit never disturbs a running job. A job gets a clean
 environment unless it passes `--env`; `CUDA_VISIBLE_DEVICES` is set by the
-daemon and a forwarded value never wins, since it is the whole of a job's GPU
-isolation.
+daemon and a forwarded value never wins. The variable states the allocation
+and the daemon also enforces it, masking the device nodes of the cards a job
+did not get so that neither `nvidia-smi` nor a container asked for
+`nvidia.com/gpu=N` can reach them. `--no-gpu-mask` turns that off.
 
 ## Running the daemon
 
@@ -164,7 +166,8 @@ cannot deliver, it names the missing piece and exits 78 (`EX_CONFIG`), which
 the unit turns into a clean stop rather than a restart loop over the same
 error. That covers cgroups v2 not being mounted, the `cpuset` or `memory`
 controller missing from its cgroup (almost always a removed `Delegate=`), an
-admin group that does not exist, and a `--dev-dir` it cannot create. Each
+admin group that does not exist, a `--dev-dir` it cannot create, and a mount
+namespace it cannot unshare to hide unallocated GPUs. Each
 refusal names the flag that opts out of the thing being refused over.
 `--no-cgroups` in particular means CPU-affinity pinning only, with no
 enforced memory limit and no NUMA confinement: fine for a laptop, not for a
@@ -178,7 +181,7 @@ No root required: run the daemon in user mode against scratch paths.
 hatch run test    # unit tests
 
 S=$(mktemp -d)
-python -m hpc_batch.daemon --no-cgroups --socket "$S/sock" \
+python -m hpc_batch.daemon --no-cgroups --no-gpu-mask --socket "$S/sock" \
     --state-dir "$S/state" --dev-dir "$S/dev" --max-lifetime 1h &
 export HPC_BATCH_SOCKET="$S/sock"
 dispatch new -- echo hello
