@@ -387,6 +387,11 @@ class TestGpuTopologyParsing:
         # read as the CPU affinity field and the NUMA one would be lost.
         assert topo.numa_node == {0: 0, 1: 0, 2: 1, 3: 1}
 
+    def test_header_underlined_with_ansi_escapes(self):
+        header, rows = TOPO_OUTPUT.split("\n", 1)
+        underlined = f"\t\x1b[4m{header.lstrip()}\x1b[0m\n{rows}"
+        assert parse_gpu_topology(underlined) == parse_gpu_topology(TOPO_OUTPUT)
+
     def test_output_without_a_numa_affinity_column(self):
         text = "\n".join(
             "\t".join(row)

@@ -67,6 +67,7 @@ _GPU_LINE = re.compile(r"^GPU (\d+):")
 _GPU_NAME = re.compile(r"^GPU(\d+)$")
 _NVLINK = re.compile(r"^NV(\d+)$")
 _MEMTOTAL_LINE = re.compile(r"^Node \d+ MemTotal:\s+(\d+) kB")
+_ANSI_SGR = re.compile(r"\x1b\[[0-9;]*m")
 
 #: Link classes from the legend of `nvidia-smi topo -m`, closest first.
 _LINK_CLASSES = ("NV", "PIX", "PXB", "PHB", "NODE", "SYS")
@@ -327,8 +328,11 @@ def parse_gpu_topology(text: str) -> GpuTopology:
     with InfiniBand the NICs get columns too, and without the width a row's
     trailing affinity fields are indistinguishable from its links. The header
     is the indented line; rows start flush left with the device name.
+
+    Driver 580 underlines that header, and does it even when stdout is a pipe,
+    so the escape lands in front of the "GPU" the header is recognised by.
     """
-    lines = text.splitlines()
+    lines = _ANSI_SGR.sub("", text).splitlines()
     header = next(
         (line for line in lines if line[:1].isspace() and line.strip().startswith("GPU")),
         None,
