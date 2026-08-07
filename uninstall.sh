@@ -26,18 +26,29 @@ if [ -x "$PREFIX/bin/hpc-batch-install" ]; then
     exec "$PREFIX/bin/hpc-batch-install" --prefix "$PREFIX" --purge "$@"
 fi
 
+# Only the console script is gone, so run the same code through the interpreter
+# rather than reaching for the sweep below.
+if [ -x "$PREFIX/bin/python3" ]; then
+    exec "$PREFIX/bin/python3" -m hpc_batch.install --prefix "$PREFIX" --purge "$@"
+fi
+
 # Fallback: the venv is gone or broken, which is a state people uninstall from.
-# Defaults only -- the packaged uninstaller is the one that reads the unit for
-# a moved --state-dir and install.json for a moved --bin-dir.
-echo "uninstall.sh: $PREFIX/bin/hpc-batch-install is missing; sweeping the defaults" >&2
+# Everything below restates what install.py owns, so it sweeps the defaults and
+# nothing else -- a --state-dir moved in a drop-in is left behind, because only
+# the packaged uninstaller reads the unit.
+echo "uninstall.sh: cannot run $PREFIX/bin/hpc-batch-install; sweeping the defaults" >&2
 BIN_DIR=${BIN_DIR:-$(sed -n 's/.*"bin_dir": *"\([^"]*\)".*/\1/p' "$PREFIX/install.json" 2>/dev/null)}
 BIN_DIR=${BIN_DIR:-/opt/bin}
 
+# PREFIX is an environment variable and the next rm is recursive.
+case "$PREFIX" in
+    */*/*) ;;
+    *) echo "uninstall.sh: refusing to remove $PREFIX: too close to /" >&2; exit 1 ;;
+esac
+
 systemctl disable --now hpc-batch 2>/dev/null || :
 rm -f /etc/systemd/system/hpc-batch.service /etc/profile.d/hpc-batch.sh
-for name in dispatch hpc-batchd hpc-batch-install; do
-    rm -f "$BIN_DIR/$name"
-done
+rm -f "$BIN_DIR"/dispatch "$BIN_DIR"/hpc-batchd "$BIN_DIR"/hpc-batch-install
 rmdir "$BIN_DIR" 2>/dev/null || :
 systemctl daemon-reload 2>/dev/null || :
 

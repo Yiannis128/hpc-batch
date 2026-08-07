@@ -5,10 +5,18 @@ import argparse
 import grp
 import re
 import time
+from pathlib import Path
 
 _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 _DURATION_RE = re.compile(r"(\d+)([smhd])")
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+
+# The daemon's defaults live here, not next to the code that uses them: the
+# installer's --purge has to delete exactly these, and importing the daemon to
+# learn three paths costs it every module the daemon pulls in.
+DEFAULT_SOCKET = "/run/hpc-batch/hpc-batch.sock"
+DEFAULT_STATE_DIR = Path("/var/lib/hpc-batch")
+DEFAULT_DEV_DIR = Path("/dev/hpc-batch")
 
 # Distro-dependent, and getting it wrong means nobody but root is an admin.
 # The installer picks the first that exists; the daemon suggests them when

@@ -15,6 +15,7 @@ gone. `--no-cgroups` is how you ask for the fallback on purpose.
 
 import logging
 import os
+import time
 from pathlib import Path
 
 from .resources import format_id_list
@@ -114,6 +115,32 @@ class CgroupManager:
         if removed:
             log.info("removed %d job cgroup(s) left by a previous daemon", removed)
 
+    def destroy(self, timeout: float = 2.0) -> list[Path]:
+        """Kill whatever is still in the job cgroups and take the tree down.
+
+        The uninstaller's half of `prune`, which deliberately spares a cgroup
+        that still holds processes: stopping the unit does not empty these
+        (KillMode=process leaves jobs running so a restart can re-adopt them)
+        and after an uninstall nothing ever comes back to reap them. Returns
+        the cgroups still busy when the timeout ran out -- SIGKILL is not
+        instant, and claiming success without looking is a guess.
+        """
+        if not self.root.is_dir():
+            return []
+        pending = sorted(self.root.glob("job-*"))
+        deadline = time.monotonic() + timeout
+        while True:
+            pending = [path for path in pending if not self.try_remove(path)]
+            if not pending or time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+        if not pending:
+            try:
+                self.root.rmdir()
+            except OSError:
+                pass
+        return pending
+
     def create(
         self,
         job_id: int,
@@ -175,9 +202,9 @@ class CgroupManager:
             os.sched_setaffinity(0, cpus)
 
     def kill(self, path: Path) -> None:
-        """SIGKILL every process in the cgroup. Absent before kernel 5.14, and
-        the write would create a file rather than do nothing anywhere that is
-        not cgroupfs."""
+        """SIGKILL every process in the cgroup. Guarded rather than left to
+        the except: outside cgroupfs the write creates the file instead of
+        failing, and the stray file then blocks the rmdir."""
         killer = path / "cgroup.kill"
         if not killer.exists():
             return

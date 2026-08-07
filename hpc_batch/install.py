@@ -24,21 +24,24 @@ import re
 import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
+from typing import NamedTuple
 
 from . import __version__
-from .cgroup import CGROUP_FS, CgroupManager
-from .daemon import DEFAULT_DEV_DIR, DEFAULT_STATE_DIR
-from .protocol import DEFAULT_SOCKET
-from .util import ADMIN_GROUPS, group_exists
+from .cgroup import CgroupManager
+from .util import (
+    ADMIN_GROUPS,
+    DEFAULT_DEV_DIR,
+    DEFAULT_SOCKET,
+    DEFAULT_STATE_DIR,
+    group_exists,
+)
 
 DEFAULT_PREFIX = Path("/opt/hpc-batch")
 DEFAULT_BIN_DIR = Path("/opt/bin")
 UNIT_PATH = Path("/etc/systemd/system/hpc-batch.service")
 PROFILE_PATH = Path("/etc/profile.d/hpc-batch.sh")
 ETC = Path("/etc")
-CGROUP_ROOT = CGROUP_FS / "hpc-batch"
 RECORD_NAME = "install.json"
 ENTRY_POINTS = ("dispatch", "hpc-batchd", "hpc-batch-install")
 
@@ -172,7 +175,13 @@ def bin_dirs_to_clean(record: dict, given: Path | None) -> set[Path]:
     return dirs or {DEFAULT_BIN_DIR}
 
 
-def daemon_paths(exec_start: str) -> dict[str, Path]:
+class DaemonPaths(NamedTuple):
+    state_dir: Path
+    dev_dir: Path
+    socket: Path
+
+
+def daemon_paths(exec_start: str) -> DaemonPaths:
     """Where the daemon actually keeps its data.
 
     Read off its command line rather than assumed, because --state-dir and
@@ -180,11 +189,11 @@ def daemon_paths(exec_start: str) -> dict[str, Path]:
     deletes the defaults would report the data gone while leaving it on disk.
     """
     found = {m.group(1): Path(m.group(2)) for m in _DIR_FLAG.finditer(exec_start)}
-    return {
-        "state_dir": found.get("state-dir", DEFAULT_STATE_DIR),
-        "dev_dir": found.get("dev-dir", DEFAULT_DEV_DIR),
-        "socket": found.get("socket", Path(DEFAULT_SOCKET)),
-    }
+    return DaemonPaths(
+        state_dir=found.get("state-dir", DEFAULT_STATE_DIR),
+        dev_dir=found.get("dev-dir", DEFAULT_DEV_DIR),
+        socket=found.get("socket", Path(DEFAULT_SOCKET)),
+    )
 
 
 def daemon_exec_start() -> str:
@@ -198,12 +207,7 @@ def daemon_exec_start() -> str:
         ["systemctl", "show", "hpc-batch", "--property=ExecStart", "--value"],
         capture_output=True, text=True, check=False,
     )
-    if shown.returncode == 0 and shown.stdout.strip():
-        return shown.stdout
-    try:
-        return UNIT_PATH.read_text()
-    except OSError:
-        return ""
+    return shown.stdout if shown.returncode == 0 else ""
 
 
 def safe_to_remove(path: Path) -> bool:
@@ -219,52 +223,36 @@ def _rmdir_if_empty(path: Path) -> None:
         pass
 
 
-def remove_cgroup_tree(root: Path, attempts: int = 20, delay: float = 0.1) -> list[Path]:
-    """Kill whatever is still in the job cgroups and take the tree down.
-
-    Stopping the unit does not do this: KillMode=process leaves jobs running
-    on purpose so a restart can re-adopt them, and after an uninstall nothing
-    ever comes back to reap them. Returns the cgroups still busy at the end --
-    SIGKILL is not instant, and claiming success without looking is a guess.
-    """
-    if not root.is_dir():
-        return []
-    manager = CgroupManager(root=root)
-    pending = sorted(root.glob("job-*"))
-    for _ in range(attempts):
-        pending = [path for path in pending if not manager.try_remove(path)]
-        if not pending:
-            break
-        time.sleep(delay)
-    if not pending:
-        _rmdir_if_empty(root)
-    return pending
-
-
-def purge(paths: dict[str, Path]) -> None:
-    """Remove everything the daemon owns at runtime: running jobs, the state
-    directory, the inspection entries and the socket."""
-    busy = remove_cgroup_tree(CGROUP_ROOT)
-    if busy:
-        listed = ", ".join(p.name for p in busy)
-        print(f"warning: could not remove {CGROUP_ROOT}: {listed} still busy")
-    elif CGROUP_ROOT.exists():
-        print(f"warning: {CGROUP_ROOT} is still there")
-
-    for key, what in (("state_dir", "job state and output"),
-                      ("dev_dir", "job inspection entries")):
-        path = paths[key]
-        if not path.exists():
-            continue
-        if not safe_to_remove(path):
-            print(f"warning: refusing to remove {path} ({what}): too close to /")
-            continue
-        shutil.rmtree(path, ignore_errors=True)
+def _remove_data(path: Path, what: str) -> None:
+    if not path.exists():
+        return
+    if not safe_to_remove(path):
+        print(f"warning: refusing to remove {path} ({what}): too close to /")
+        return
+    shutil.rmtree(path, ignore_errors=True)
+    # rmtree swallowed whatever went wrong, so look rather than announce.
+    if path.exists():
+        print(f"warning: could not fully remove {path} ({what})")
+    else:
         print(f"removed {path} ({what})")
 
-    socket = paths["socket"]
-    socket.unlink(missing_ok=True)
-    _rmdir_if_empty(socket.parent)
+
+def purge(paths: DaemonPaths) -> None:
+    """Remove everything the daemon owns at runtime: running jobs, the state
+    directory, the inspection entries and the socket."""
+    cgroups = CgroupManager()
+    busy = cgroups.destroy()
+    if busy:
+        listed = ", ".join(p.name for p in busy)
+        print(f"warning: could not remove {cgroups.root}: {listed} still busy")
+    elif cgroups.root.exists():
+        print(f"warning: {cgroups.root} is still there")
+
+    _remove_data(paths.state_dir, "job state and output")
+    _remove_data(paths.dev_dir, "job inspection entries")
+
+    paths.socket.unlink(missing_ok=True)
+    _rmdir_if_empty(paths.socket.parent)
 
 
 def unit_template() -> str:
@@ -389,7 +377,7 @@ def uninstall(args: argparse.Namespace) -> None:
         purge(paths)
         print("purged: no job history, queued jobs or undelivered output left")
     else:
-        print(f"left {paths['state_dir']} alone: it holds job history and "
+        print(f"left {paths.state_dir} alone: it holds job history and "
               f"queued jobs, and jobs still running were not killed")
         print("pass --purge to remove those too")
 

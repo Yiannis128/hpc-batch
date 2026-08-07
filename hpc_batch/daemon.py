@@ -61,14 +61,17 @@ from .resources import (
     total_memory_gb,
 )
 from .scheduling import FIFO_STRICT, MODES, Reservation, plan
-from .util import ADMIN_GROUPS, duration_arg, format_duration, format_gb, group_exists
+from .util import (
+    ADMIN_GROUPS,
+    DEFAULT_DEV_DIR,
+    DEFAULT_STATE_DIR,
+    duration_arg,
+    format_duration,
+    format_gb,
+    group_exists,
+)
 
 log = logging.getLogger("hpc-batchd")
-
-# Where the daemon keeps its data. Named here rather than only in parse_args
-# because the installer's --purge has to delete exactly these.
-DEFAULT_STATE_DIR = Path("/var/lib/hpc-batch")
-DEFAULT_DEV_DIR = Path("/dev/hpc-batch")
 
 TICK_S = 1.0
 KILL_GRACE_S = 10.0
