@@ -42,6 +42,14 @@ local changes in a drop-in (`systemctl edit hpc-batch`). `--uninstall`
 removes everything except `/var/lib/hpc-batch`, so job history and queued
 jobs survive. `hpc-batch-install --help` covers the rest.
 
+Where it put things is recorded in `/opt/hpc-batch/install.json`, and later
+runs read it: a bare upgrade repeats the first install's `--bin-dir` and
+`--admin-group` rather than falling back to the defaults, and passing a
+*different* value is refused instead of quietly leaving a second set of
+symlinks behind. Uninstall first if you want to move them. `PATH` is only
+touched when nothing already puts the bin directory there, so a host with its
+own `/etc/profile.d` entry does not end up with the directory listed twice.
+
 Do **not** install with `sudo pipx`. It puts the entry points in
 `/root/.local/bin` (mode 700), where `hpc-batchd` still works but no other
 user can run the client.

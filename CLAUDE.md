@@ -39,7 +39,7 @@ One root daemon, one unix socket, a thin client. Layered so the interesting part
 - `cgroup.py` — writes `cpuset.cpus`, `cpuset.mems`, `memory.max`. Enforcement only; it makes no decisions.
 - `daemon.py` — the only stateful actor: socket, queue, spawn, reap, persist, permissions. Every mutation of a `Job` goes through `_job_changed`, which rewrites `info.json` and marks state dirty; skip it and the on-disk view is stale until something else happens to persist.
 - `client.py` — thin.
-- `install.py` — picks the first of `util.ADMIN_GROUPS` that exists on the host and rewrites the systemd unit from the packaged template on *every* run, upgrades included. Reordering that tuple silently moves admin control over every job on a box that has both `wheel` and `sudo`.
+- `install.py` — picks the first of `util.ADMIN_GROUPS` that exists on the host and rewrites the systemd unit from the packaged template on *every* run, upgrades included. Reordering that tuple silently moves admin control over every job on a box that has both `wheel` and `sudo`. `install.json` in the prefix records what a run chose. `settle()` governs what `install()` does with it: an option not passed comes from the record rather than from the default, so `detect_admin_group()` cannot hand admin to a group that appeared on the box after the install, and an upgrade cannot relocate the entry points and orphan the old ones; an option passed with a different value is refused, because nothing here migrates an existing install. `uninstall()` deliberately does not settle — `bin_dirs_to_clean()` unions the recorded and requested directories, since cleanup wants every place a symlink might be.
 
 ### Invariants worth knowing before changing anything
 

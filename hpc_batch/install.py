@@ -7,7 +7,10 @@ at the right binary with an admin group that exists on this distro.
 
 It is also the upgrade path, so every step is idempotent: rerunning it
 reinstalls the package and reloads the daemon rather than restarting it,
-which is what keeps running jobs alive.
+which is what keeps running jobs alive. What it chose is recorded in
+`install.json` inside the prefix, so a bare upgrade repeats the first
+install's layout instead of falling back to the defaults and leaving the
+old entry points behind unmanaged.
 
 Refusals follow the daemon's rule -- if something was asked for and cannot
 be provided, say so and stop, rather than installing something that looks
@@ -15,6 +18,7 @@ finished and is not.
 """
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -29,7 +33,11 @@ DEFAULT_PREFIX = Path("/opt/hpc-batch")
 DEFAULT_BIN_DIR = Path("/opt/bin")
 UNIT_PATH = Path("/etc/systemd/system/hpc-batch.service")
 PROFILE_PATH = Path("/etc/profile.d/hpc-batch.sh")
+ETC = Path("/etc")
+RECORD_NAME = "install.json"
 ENTRY_POINTS = ("dispatch", "hpc-batchd", "hpc-batch-install")
+
+_PATH_ASSIGNMENT = re.compile(r"\bPATH\s*=")
 
 
 class InstallError(Exception):
@@ -73,6 +81,89 @@ def profile_snippet(bin_dir: Path) -> str:
         f"esac\n"
         "export PATH\n"
     )
+
+
+def login_path_provides(
+    bin_dir: Path, etc: Path = ETC, skip: Path | None = None
+) -> Path | None:
+    """Which login-shell config already puts `bin_dir` on PATH, if any.
+
+    Reading the config rather than `$PATH` is the whole point: the installer
+    runs under sudo, so its own environment is root's, and the question is
+    what some other user's login shell will end up with. A false positive
+    leaves nobody with `dispatch` on their PATH, so the caller prints the
+    file this believed.
+    """
+    entry = re.compile(r"(?<![\w/])" + re.escape(str(bin_dir).rstrip("/")) + r"/?(?![\w/])")
+    candidates = [etc / "environment", etc / "profile"]
+    candidates += sorted((etc / "profile.d").glob("*.sh"))
+    for path in candidates:
+        if skip is not None and path == skip:
+            continue
+        try:
+            lines = path.read_text().splitlines()
+        except OSError:
+            continue
+        if any(_PATH_ASSIGNMENT.search(line) and entry.search(line) for line in lines):
+            return path
+    return None
+
+
+def read_record(prefix: Path) -> dict:
+    """What the last install of this prefix chose, or {} for a fresh one.
+
+    Unreadable or corrupt reads as absent. The record exists to catch a
+    contradiction, and there is none to catch when we cannot tell what was
+    chosen; refusing on a damaged file would only block the reinstall that
+    fixes it.
+    """
+    try:
+        record = json.loads((prefix / RECORD_NAME).read_text())
+    except (OSError, ValueError):
+        return {}
+    return record if isinstance(record, dict) else {}
+
+
+def write_record(prefix: Path, bin_dir: Path, admin_group: str) -> None:
+    (prefix / RECORD_NAME).write_text(
+        json.dumps({"bin_dir": str(bin_dir), "admin_group": admin_group}, indent=2) + "\n"
+    )
+
+
+def settle(record: dict, key: str, given: str | Path | None) -> str | None:
+    """Reconcile one option against the last install of this prefix.
+
+    Not passing the flag means "whatever last time did", so a bare upgrade
+    cannot quietly move the entry points and leave the old ones behind, and
+    an admin group that only appeared on the box later cannot silently take
+    over. Passing something else is a refusal rather than a migration: the
+    old install is still on disk and nothing here would move it. The flag
+    name is derived from the key so a refusal cannot name the wrong option.
+    """
+    flag = "--" + key.replace("_", "-")
+    remembered = record.get(key)
+    if given is None:
+        return remembered
+    if remembered is not None and str(remembered) != str(given):
+        raise InstallError(
+            f"{flag} {given} disagrees with the {remembered} this prefix was "
+            f"installed with; rerun without {flag} to keep {remembered}, or "
+            f"'hpc-batch-install --uninstall' first and install again"
+        )
+    return str(given)
+
+
+def bin_dirs_to_clean(record: dict, given: Path | None) -> set[Path]:
+    """Everywhere uninstall should look for entry points.
+
+    A union rather than a settlement: cleanup wants every place a symlink
+    might be, and refusing a --bin-dir that disagrees with the record would
+    leave behind exactly the split install it was passed to sweep up.
+    """
+    dirs = {Path(record["bin_dir"])} if record.get("bin_dir") else set()
+    if given:
+        dirs.add(given)
+    return dirs or {DEFAULT_BIN_DIR}
 
 
 def unit_template() -> str:
@@ -120,30 +211,40 @@ def _make_venv(prefix: Path) -> Path:
 
 def install(args: argparse.Namespace) -> None:
     _check_preconditions()
-    admin_group = args.admin_group or detect_admin_group()
+    record = read_record(args.prefix)
+    bin_dir = Path(settle(record, "bin_dir", args.bin_dir) or DEFAULT_BIN_DIR)
+    admin_group = settle(record, "admin_group", args.admin_group) or detect_admin_group()
 
     if not args.already_installed:
         pip = _make_venv(args.prefix)
         _run([str(pip), "install", "--upgrade", args.spec], f"install {args.spec}")
 
-    args.bin_dir.mkdir(parents=True, exist_ok=True)
+    bin_dir.mkdir(parents=True, exist_ok=True)
     for name in ENTRY_POINTS:
         target = args.prefix / "bin" / name
         if not target.exists():
             raise InstallError(f"{target} was not installed by {args.spec}")
-        link = args.bin_dir / name
+        link = bin_dir / name
         link.unlink(missing_ok=True)
         link.symlink_to(target)
-    print(f"installed {', '.join(ENTRY_POINTS)} in {args.bin_dir}")
+    print(f"installed {', '.join(ENTRY_POINTS)} in {bin_dir}")
 
-    PROFILE_PATH.write_text(profile_snippet(args.bin_dir))
-    PROFILE_PATH.chmod(0o644)
-    print(f"wrote {PROFILE_PATH} (login shells pick it up; this one will not)")
+    provider = login_path_provides(bin_dir, skip=PROFILE_PATH)
+    if provider is None:
+        PROFILE_PATH.write_text(profile_snippet(bin_dir))
+        PROFILE_PATH.chmod(0o644)
+        print(f"wrote {PROFILE_PATH} (login shells pick it up; this one will not)")
+    else:
+        verb = "removed" if PROFILE_PATH.exists() else "skipped"
+        PROFILE_PATH.unlink(missing_ok=True)
+        print(f"{verb} {PROFILE_PATH}: {provider} already puts {bin_dir} on PATH")
 
-    unit = render_unit(unit_template(), args.bin_dir / "hpc-batchd", admin_group)
+    unit = render_unit(unit_template(), bin_dir / "hpc-batchd", admin_group)
     UNIT_PATH.write_text(unit)
     UNIT_PATH.chmod(0o644)
     print(f"wrote {UNIT_PATH} (admin group: {admin_group})")
+
+    write_record(args.prefix, bin_dir, admin_group)
 
     _run(["systemctl", "daemon-reload"], "reload the systemd manager")
     if args.no_start:
@@ -166,15 +267,18 @@ def install(args: argparse.Namespace) -> None:
 
 def uninstall(args: argparse.Namespace) -> None:
     _check_preconditions()
+    bin_dirs = bin_dirs_to_clean(read_record(args.prefix), args.bin_dir)
     subprocess.run(["systemctl", "disable", "--now", "hpc-batch"], check=False)
     for path in (UNIT_PATH, PROFILE_PATH):
         path.unlink(missing_ok=True)
         print(f"removed {path}")
-    for name in ENTRY_POINTS:
-        (args.bin_dir / name).unlink(missing_ok=True)
+    for bin_dir in sorted(bin_dirs):
+        for name in ENTRY_POINTS:
+            (bin_dir / name).unlink(missing_ok=True)
     shutil.rmtree(args.prefix, ignore_errors=True)
     _run(["systemctl", "daemon-reload"], "reload the systemd manager")
-    print(f"removed {args.prefix} and the {args.bin_dir} entry points")
+    listed = ", ".join(str(d) for d in sorted(bin_dirs))
+    print(f"removed {args.prefix} and the entry points in {listed}")
     print("left /var/lib/hpc-batch alone: it holds job history and queued jobs")
 
 
@@ -187,13 +291,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--prefix", type=Path, default=DEFAULT_PREFIX, metavar="DIR",
                         help=f"virtualenv to install into (default: {DEFAULT_PREFIX})")
-    parser.add_argument("--bin-dir", type=Path, default=DEFAULT_BIN_DIR, metavar="DIR",
+    parser.add_argument("--bin-dir", type=Path, default=None, metavar="DIR",
                         help=f"where the entry points are linked, and what is "
-                             f"added to PATH (default: {DEFAULT_BIN_DIR})")
+                             f"added to PATH (default: whatever the last "
+                             f"install used, else {DEFAULT_BIN_DIR})")
     parser.add_argument("--admin-group", default=None, metavar="GROUP",
                         help=f"group whose members administer all jobs "
-                             f"(default: the first of {', '.join(ADMIN_GROUPS)} "
-                             f"that exists here)")
+                             f"(default: whatever the last install used, else "
+                             f"the first of {', '.join(ADMIN_GROUPS)} that "
+                             f"exists here)")
     parser.add_argument("--spec", default="hpc-batch", metavar="SPEC",
                         help="what to install, as pip would take it: a version "
                              "spec like 'hpc-batch==0.2.0', or a path to a "
