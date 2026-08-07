@@ -3,9 +3,11 @@
 Every request is a single JSON object on one line. Every response starts with
 a single JSON object on one line; for `attach` the response line is followed
 by a raw byte stream of the job's output until the connection closes.
+
+The framing lives here, the transports do not: keep this module free of
+asyncio, or every `dispatch` pays for an event loop it never runs.
 """
 
-import asyncio
 import json
 import os
 
@@ -40,23 +42,3 @@ def err(message: str) -> dict:
 def socket_path() -> str:
     """Socket path used by the client; override with $HPC_BATCH_SOCKET."""
     return os.environ.get("HPC_BATCH_SOCKET", DEFAULT_SOCKET)
-
-
-async def read_json(reader: asyncio.StreamReader) -> dict | None:
-    """Read one JSON line from an asyncio stream; None on EOF or garbage."""
-    try:
-        line = await reader.readline()
-    except (asyncio.LimitOverrunError, ValueError):
-        return None
-    if not line:
-        return None
-    try:
-        obj = json.loads(line)
-    except json.JSONDecodeError:
-        return None
-    return obj if isinstance(obj, dict) else None
-
-
-async def send_json(writer: asyncio.StreamWriter, obj: dict) -> None:
-    writer.write(encode(obj))
-    await writer.drain()

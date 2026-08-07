@@ -34,7 +34,7 @@ from pathlib import Path
 from . import __version__
 from .cgroup import CgroupError, CgroupManager
 from .devices import GpuMaskError, check_supported, gpu_nodes, mask_foreign_gpus, nodes_to_mask
-from .jobs import DONE, QUEUED, RUNNING, Job
+from .jobs import DONE, QUEUED, RUNNING, STATE_FILE_NAME, Job, StateError, proc_starttime, read_state
 from .modify import FIELDS, ModError
 from .protocol import (
     DEFAULT_SOCKET,
@@ -43,9 +43,8 @@ from .protocol import (
     MAX_LINE,
     OOM,
     TIMEOUT,
+    encode,
     err,
-    read_json,
-    send_json,
 )
 from .resources import (
     Allocation,
@@ -208,13 +207,24 @@ def peer_creds(sock: socket.socket) -> tuple[int, int, int]:
     return pid, uid, gid
 
 
-def proc_starttime(pid: int) -> int | None:
-    """starttime field of /proc/<pid>/stat; used to guard against pid reuse."""
+async def read_json(reader: asyncio.StreamReader) -> dict | None:
+    """Read one protocol frame from an asyncio stream; None on EOF or garbage."""
     try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
-        return int(stat.rsplit(")", 1)[1].split()[19])
-    except (OSError, ValueError, IndexError):
+        line = await reader.readline()
+    except (asyncio.LimitOverrunError, ValueError):
         return None
+    if not line:
+        return None
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+async def send_json(writer: asyncio.StreamWriter, obj: dict) -> None:
+    writer.write(encode(obj))
+    await writer.drain()
 
 
 class Daemon:
@@ -250,7 +260,7 @@ class Daemon:
 
     @property
     def state_file(self) -> Path:
-        return self.cfg.state_dir / "state.json"
+        return self.cfg.state_dir / STATE_FILE_NAME
 
     # -- permissions -----------------------------------------------------
 
@@ -423,10 +433,8 @@ class Daemon:
         if not self.state_file.exists():
             return
         try:
-            data = json.loads(self.state_file.read_text())
-            self.next_id = int(data.get("next_id", 1))
-            jobs = [Job.from_dict(j) for j in data.get("jobs", [])]
-        except (OSError, ValueError, TypeError, KeyError) as exc:
+            self.next_id, jobs = read_state(self.cfg.state_dir)
+        except StateError as exc:
             log.error("corrupt state file %s (%s); starting fresh", self.state_file, exc)
             with contextlib.suppress(OSError):
                 self.state_file.rename(self.state_file.with_suffix(".corrupt"))
@@ -787,12 +795,8 @@ class Daemon:
             return False, os.waitstatus_to_exitcode(status)
         except ChildProcessError:
             pass
-        # Not our child (daemon was fully restarted): fall back to /proc,
-        # comparing starttime so a recycled pid is not mistaken for the job.
-        start = proc_starttime(job.pid)
-        if start is not None and start == job.proc_start:
-            return True, None
-        return False, None
+        # Not our child (daemon was fully restarted): fall back to /proc.
+        return job.still_alive(), None
 
     def _request_kill(self, job: Job, reason: str) -> None:
         if job.state != RUNNING:

@@ -1,10 +1,30 @@
-"""The Job model shared by the daemon's queue, state file and job info files."""
+"""The Job model shared by the daemon's queue, state file and job info files,
+and the reading of that state file: the daemon restores itself from it, and
+the installer's --purge reads it to find jobs nothing is left to reap."""
 
+import json
 import shlex
 from dataclasses import asdict, dataclass, field, fields
+from pathlib import Path
 
 from .protocol import DONE, QUEUED, RUNNING
 from .resources import Allocation, Request, charged_nodes
+
+STATE_FILE_NAME = "state.json"
+
+
+class StateError(Exception):
+    """state.json could not be read: absent, unreadable or not the shape we
+    write. Carries the cause, which the daemon logs."""
+
+
+def proc_starttime(pid: int) -> int | None:
+    """starttime field of /proc/<pid>/stat; used to guard against pid reuse."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return int(stat.rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 @dataclass
@@ -67,6 +87,20 @@ class Job:
         yet, measured from now (its start is bounded below by now)."""
         start = self.start_time if self.start_time is not None else now
         return start + self.max_time_s
+
+    def still_alive(self) -> bool:
+        """Whether the recorded pid is still this job's process.
+
+        Asked of `/proc` rather than of our children, so it also answers for
+        a daemon that was fully restarted -- and for the installer, with no
+        daemon at all. starttime is what makes it safe: a recycled pid is a
+        different process, and a state file too old to carry one cannot be
+        checked, so it answers no rather than guessing. Callers SIGKILL a
+        process group on the strength of this.
+        """
+        if self.pid is None or self.proc_start is None:
+            return False
+        return proc_starttime(self.pid) == self.proc_start
 
     def request(self) -> Request:
         """What this job is asking the pool for."""
@@ -150,3 +184,30 @@ class Job:
             "output_dest": self.output_dest,
             "output_error": self.output_error,
         }
+
+
+def read_state(state_dir: Path) -> tuple[int, list[Job]]:
+    """Parse state.json into (next_id, jobs), or raise StateError.
+
+    AttributeError is in the net because a top-level JSON value that is not
+    an object has no `.get` -- rarer than a truncated write, and the same
+    kind of broken.
+    """
+    try:
+        data = json.loads((state_dir / STATE_FILE_NAME).read_text())
+        return int(data.get("next_id", 1)), [Job.from_dict(j) for j in data.get("jobs", [])]
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        raise StateError(exc) from exc
+
+
+def running_jobs(state_dir: Path) -> list[Job]:
+    """The jobs state.json says were running when it was last written.
+
+    Unreadable state yields nothing rather than raising: the caller is the
+    installer, and a corrupt file is one of the things a purge cleans up.
+    """
+    try:
+        _, jobs = read_state(state_dir)
+    except StateError:
+        return []
+    return [job for job in jobs if job.state == RUNNING]

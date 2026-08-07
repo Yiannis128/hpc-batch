@@ -5,6 +5,9 @@ what lands in /etc/profile.d. The steps with side effects (venv, systemctl)
 are left to the machine, but the decisions they act on are all here.
 """
 
+import json
+import signal
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -15,6 +18,7 @@ from hpc_batch.install import (
     bin_dirs_to_clean,
     daemon_paths,
     detect_admin_group,
+    kill_running_jobs,
     login_path_provides,
     profile_snippet,
     read_record,
@@ -25,7 +29,9 @@ from hpc_batch.install import (
     write_record,
 )
 from hpc_batch.cgroup import CgroupManager
+from hpc_batch.jobs import DONE, QUEUED, RUNNING, STATE_FILE_NAME, Job, proc_starttime
 from hpc_batch.util import ADMIN_GROUPS
+from test_jobs import make_job
 
 
 class TestDetectAdminGroup:
@@ -230,6 +236,70 @@ class TestDaemonPaths:
 
     def test_takes_an_equals_sign_too(self):
         assert daemon_paths("--dev-dir=/dev/foo").dev_dir == Path("/dev/foo")
+
+
+@pytest.fixture
+def sleeper():
+    """A job-like process: its own session, as the daemon spawns them, so a
+    killpg on its pid reaches it."""
+    proc = subprocess.Popen(["sleep", "600"], start_new_session=True)
+    yield proc
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait()
+
+
+def write_state(state_dir: Path, jobs: list[Job]) -> Path:
+    state_dir.mkdir(parents=True, exist_ok=True)
+    data = {"next_id": 1, "jobs": [j.to_dict() for j in jobs]}
+    (state_dir / STATE_FILE_NAME).write_text(json.dumps(data))
+    return state_dir
+
+
+def job_of(proc: subprocess.Popen, **over) -> Job:
+    running = dict(state=RUNNING, pid=proc.pid, proc_start=proc_starttime(proc.pid))
+    return make_job(**(running | over))
+
+
+class TestKillRunningJobs:
+    def test_kills_a_job_the_stopped_daemon_left_behind(self, tmp_path, sleeper):
+        # The regression: with --no-cgroups there is no cgroup tree to walk,
+        # so these pids are the only handle on a running job. Purge used to
+        # delete the state dir and report success while the job kept running.
+        state = write_state(tmp_path / "state", [job_of(sleeper)])
+        assert kill_running_jobs(state) == [1]
+        assert sleeper.wait(timeout=5) == -signal.SIGKILL
+
+    def test_a_recycled_pid_is_not_killed(self, tmp_path, sleeper):
+        # The daemon may have died days ago and the pid now belong to
+        # something with nothing to do with us.
+        job = job_of(sleeper, proc_start=proc_starttime(sleeper.pid) + 1)
+        assert kill_running_jobs(write_state(tmp_path / "state", [job])) == []
+        assert sleeper.poll() is None
+
+    def test_a_job_with_no_recorded_starttime_is_not_killed(self, tmp_path, sleeper):
+        # An older state file cannot prove the pid is still the job's, and an
+        # unverified killpg is somebody else's process group.
+        job = job_of(sleeper, proc_start=None)
+        assert kill_running_jobs(write_state(tmp_path / "state", [job])) == []
+        assert sleeper.poll() is None
+
+    def test_finished_and_queued_jobs_are_left_alone(self, tmp_path, sleeper):
+        jobs = [job_of(sleeper, id=1, state=DONE), job_of(sleeper, id=2, state=QUEUED, pid=None)]
+        assert kill_running_jobs(write_state(tmp_path / "state", jobs)) == []
+        assert sleeper.poll() is None
+
+    def test_no_state_file_is_not_an_error(self, tmp_path):
+        assert kill_running_jobs(tmp_path / "absent") == []
+
+    @pytest.mark.parametrize("text", ["{ this is not json", "[1, 2, 3]", "null"])
+    def test_unreadable_state_is_not_an_error(self, tmp_path, text):
+        # Not only truncation: a top-level value that is not an object has no
+        # .get, and purge must still take the machine down.
+        state = tmp_path / "state"
+        state.mkdir()
+        (state / STATE_FILE_NAME).write_text(text)
+        assert kill_running_jobs(state) == []
 
 
 class TestSafeToRemove:

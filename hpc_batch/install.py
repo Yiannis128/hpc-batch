@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -29,6 +30,7 @@ from typing import NamedTuple
 
 from . import __version__
 from .cgroup import CgroupManager
+from .jobs import running_jobs
 from .util import (
     ADMIN_GROUPS,
     DEFAULT_DEV_DIR,
@@ -237,9 +239,32 @@ def _remove_data(path: Path, what: str) -> None:
         print(f"removed {path} ({what})")
 
 
+def kill_running_jobs(state_dir: Path) -> list[int]:
+    """SIGKILL the process group of every job state.json says is running.
+
+    Under --no-cgroups there is no tree to walk, so these pids are the only
+    handle on the jobs. Returns the ids actually killed.
+    """
+    killed = []
+    for job in running_jobs(state_dir):
+        if not job.still_alive():
+            continue
+        try:
+            os.killpg(job.pid, signal.SIGKILL)
+        except OSError:
+            continue  # already gone, or not ours to kill
+        killed.append(job.id)
+    return killed
+
+
 def purge(paths: DaemonPaths) -> None:
     """Remove everything the daemon owns at runtime: running jobs, the state
     directory, the inspection entries and the socket."""
+    killed = kill_running_jobs(paths.state_dir)
+    if killed:
+        listed = ", ".join(str(i) for i in killed)
+        print(f"killed {len(killed)} running job(s): {listed}")
+
     cgroups = CgroupManager()
     busy = cgroups.destroy()
     if busy:
