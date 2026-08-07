@@ -33,7 +33,7 @@ from pathlib import Path
 
 from . import __version__
 from .cgroup import CgroupError, CgroupManager
-from .devices import GpuMaskError, check_supported, mask_foreign_gpus
+from .devices import GpuMaskError, check_supported, gpu_nodes, mask_foreign_gpus, nodes_to_mask
 from .jobs import DONE, QUEUED, RUNNING, Job
 from .modify import FIELDS, ModError
 from .protocol import (
@@ -217,6 +217,7 @@ class Daemon:
         self.next_id = 1
         self.pool: ResourcePool | None = None
         self.cgroups = CgroupManager(enabled=cfg.use_cgroups)
+        self._mask_gpus = False  # settled in _setup_pool, once the gpus are known
         self.admin_gid: int | None = None
         self.is_root = os.getuid() == 0
         self._procs: dict[int, subprocess.Popen] = {}
@@ -354,9 +355,13 @@ class Daemon:
     def _setup_pool(self) -> None:
         nodes = discover_numa_nodes()
         gpus = discover_gpus()
-        if self.cfg.mask_gpus:
+        # Only when there are GPUs to schedule: masking every card on a
+        # machine whose GPUs this daemon does not allocate buys no isolation
+        # and takes them away from jobs that were never competing for them.
+        self._mask_gpus = self.cfg.mask_gpus and bool(gpus)
+        if self._mask_gpus:
             try:
-                check_supported(gpus)
+                check_supported()
             except GpuMaskError as exc:
                 raise StartupError(str(exc)) from exc
         topology = discover_gpu_topology() if gpus else GpuTopology()
@@ -677,6 +682,9 @@ class Daemon:
         out_path = self.output_path(job.id)
         mem_bytes = int(alloc.mem_gb * (1 << 30)) if alloc.mem_gb else None
         cg = self.cgroups.create(job.id, alloc.cpus, alloc.mem_nodes(), mem_bytes)
+        # Listed here rather than in preexec: the child runs between fork and
+        # exec, where the less it does than raw syscalls the better.
+        gpu_mask = nodes_to_mask(alloc.gpus, gpu_nodes()) if self._mask_gpus else []
 
         out_fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o640)
         devnull = os.open(os.devnull, os.O_RDONLY)
@@ -685,8 +693,7 @@ class Daemon:
         def preexec() -> None:
             # Runs in the child, still as root, just before exec.
             self.cgroups.confine_current(cg, alloc.cpus)
-            if self.cfg.mask_gpus:
-                mask_foreign_gpus(alloc.gpus)
+            mask_foreign_gpus(gpu_mask)
             drop_privileges(job.uid, pw.pw_gid, pw.pw_name)
             os.chdir(job.cwd)  # as the target user, so permissions apply
 
@@ -747,8 +754,8 @@ class Daemon:
             "HPC_BATCH_JOB_ID": str(job.id),
         }
         if self.pool.gpu_ids:
-            # A forwarded one must never win: this is the whole of a job's gpu
-            # isolation. Empty string for 0-gpu jobs, which must see no gpu.
+            # A forwarded one must never win: it states the allocation, which
+            # devices.py then enforces. Empty string for 0-gpu jobs.
             ours["CUDA_VISIBLE_DEVICES"] = format_id_list(alloc.gpus)
         return defaults | job.env | ours
 

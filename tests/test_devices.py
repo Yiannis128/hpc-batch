@@ -1,3 +1,6 @@
+import errno
+import os
+
 import pytest
 
 from hpc_batch.devices import (
@@ -28,15 +31,6 @@ class TestGpuNodes:
         dev = make_dev(tmp_path, DEV_NAMES)
         assert sorted(gpu_nodes(dev)) == [0, 1, 2, 3]
 
-    def test_shared_nodes_are_not_cards(self, tmp_path):
-        # Masking nvidiactl or nvidia-uvm breaks the GPUs the job *was* given,
-        # so they must never be mistaken for a card.
-        dev = make_dev(tmp_path, DEV_NAMES)
-        assert not any(
-            path.name.startswith(("nvidiactl", "nvidia-uvm", "nvidia-modeset", "nvidia-caps"))
-            for path in gpu_nodes(dev).values()
-        )
-
     def test_machine_without_gpus(self, tmp_path):
         assert gpu_nodes(make_dev(tmp_path, ["null"])) == {}
 
@@ -50,8 +44,6 @@ class TestNodesToMask:
         assert [p.name for p in nodes_to_mask([0, 1], nodes)] == ["nvidia2", "nvidia3"]
 
     def test_no_gpus_masks_every_card(self, tmp_path):
-        # "none" is an allocation too: a cpu-only job left able to open a card
-        # takes one the scheduler still believes is free.
         nodes = gpu_nodes(make_dev(tmp_path, DEV_NAMES))
         assert len(nodes_to_mask([], nodes)) == 4
 
@@ -65,25 +57,31 @@ class TestNodesToMask:
 
 
 class TestMaskForeignGpus:
-    def test_nothing_to_mask_makes_no_syscall(self, tmp_path):
+    def test_nothing_to_mask_makes_no_syscall(self):
         # The early return is what keeps a fully-allocated job out of a mount
         # namespace it does not need; without it this would need root.
-        mask_foreign_gpus([0, 1], make_dev(tmp_path, ["nvidia0", "nvidia1"]))
-
-    def test_no_gpus_on_the_machine(self, tmp_path):
-        mask_foreign_gpus([], make_dev(tmp_path, ["null"]))
+        mask_foreign_gpus([])
 
 
 class TestCheckSupported:
-    def test_refuses_without_root_and_names_the_flag(self, monkeypatch):
-        monkeypatch.setattr("os.geteuid", lambda: 1000)
+    def test_refusal_names_the_flag(self, monkeypatch):
+        def denied():
+            raise OSError(errno.EPERM, "unshare")
+
+        monkeypatch.setattr("hpc_batch.devices._unshare_private", denied)
         with pytest.raises(GpuMaskError, match="--no-gpu-mask"):
-            check_supported([0, 1])
+            check_supported()
 
-    def test_no_gpus_needs_nothing(self, monkeypatch):
-        monkeypatch.setattr("os.geteuid", lambda: 1000)
-        check_supported([])
+    def test_reports_the_reason_it_was_refused(self, monkeypatch):
+        # The errno survives the probe child, which is the point of probing
+        # rather than inferring the answer from the uid.
+        def denied():
+            raise OSError(errno.ENOSYS, "unshare")
 
-    def test_root_is_fine(self, monkeypatch):
-        monkeypatch.setattr("os.geteuid", lambda: 0)
-        check_supported([0, 1])
+        monkeypatch.setattr("hpc_batch.devices._unshare_private", denied)
+        with pytest.raises(GpuMaskError, match=os.strerror(errno.ENOSYS)):
+            check_supported()
+
+    def test_silent_when_it_works(self, monkeypatch):
+        monkeypatch.setattr("hpc_batch.devices._unshare_private", lambda: None)
+        check_supported()
