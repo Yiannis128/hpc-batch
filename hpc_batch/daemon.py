@@ -34,6 +34,7 @@ from pathlib import Path
 from . import __version__
 from .cgroup import CgroupError, CgroupManager
 from .jobs import DONE, QUEUED, RUNNING, Job
+from .modify import FIELDS, ModError
 from .protocol import (
     DEFAULT_SOCKET,
     ERROR,
@@ -966,6 +967,8 @@ class Daemon:
                 await send_json(writer, self._h_list(req, uid))
             elif cmd == "kill":
                 await send_json(writer, self._h_kill(req, uid))
+            elif cmd == "job":
+                await send_json(writer, self._h_job(req, uid))
             else:
                 await send_json(writer, err(f"unknown command {cmd!r}"))
         except (ConnectionResetError, BrokenPipeError):
@@ -1021,6 +1024,51 @@ class Daemon:
         self._request_kill(job, KILLED)
         self._persist()
         return {"ok": True, "state": "killing"}
+
+    def _h_job(self, req: dict, uid: int) -> dict:
+        """Read or change one field of one job, per the `modify.FIELDS` table.
+
+        Two gates, not one. `_find_job` settles who may see the job at all;
+        the action's own `admin_only` then settles who may change it, so a
+        user reading their own job's limits never implies they can rewrite
+        the terms it was admitted under.
+        """
+        job, problem = self._find_job(req, uid)
+        if problem:
+            return problem
+        # isinstance because a client can send anything, and an unhashable
+        # key would make dict.get raise rather than miss.
+        name, verb = req.get("field"), req.get("action")
+        field = FIELDS.get(name) if isinstance(name, str) else None
+        if field is None:
+            return err(f"unknown field {name!r}; try one of: {', '.join(FIELDS)}")
+        action = field.actions.get(verb) if isinstance(verb, str) else None
+        if action is None:
+            return err(
+                f"cannot {verb!r} {field.name}; try one of: {', '.join(field.actions)}"
+            )
+        if action.admin_only and not self.is_admin(uid):
+            return err(
+                f"'job {field.name} {action.name}' requires membership of group "
+                f"{self.cfg.admin_group!r}"
+            )
+        before = field.read(job)
+        if not action.mutates:
+            return {"ok": True, "value": before}
+        if job.state == DONE:
+            return err(f"job {job.id} already finished")
+        try:
+            field.apply(job, action.name, req.get("value"))
+        except ModError as exc:
+            return err(str(exc))
+        after = field.read(job)
+        self._job_changed(job)
+        self._persist()
+        log.info(
+            "job %d: %s changed from %s to %s by uid %d",
+            job.id, field.name, field.render(before), field.render(after), uid,
+        )
+        return {"ok": True, "value": after, "before": before}
 
     async def _h_attach(self, req: dict, uid: int, writer: asyncio.StreamWriter) -> None:
         job, problem = self._find_job(req, uid)

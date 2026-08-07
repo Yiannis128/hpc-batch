@@ -55,7 +55,14 @@ dispatch new --cpu 2 --gpu-cores 3 --max-mem 84 --max-time 2h -- ./bench.sh
 dispatch list           # --all for everyone's, --finished for exit statuses
 dispatch attach 7       # follow a job's output, like tail -f
 dispatch kill 7         # kill a running job, or drop a queued one
+dispatch job 7 max-time get      # what limit is this job running under?
+dispatch job 7 max-time add 2d   # give it two more days (admins)
 ```
+
+`dispatch job` reads or changes one setting on a job. Each action carries its
+own permission: anyone can read their own job's `max-time`, but only admins
+can `set` or `add` to it, since that is the ceiling the job was admitted
+under.
 
 `dispatch new --help` lists the options. The ones worth knowing about:
 `--exclusive` waits for an idle machine and keeps it, `--numa-local` keeps
