@@ -15,7 +15,7 @@ Run the daemon without root, against scratch paths:
 
 ```sh
 S=$(mktemp -d)
-python -m hpc_batch.daemon --no-cgroups --socket "$S/sock" \
+python -m hpc_batch.daemon --no-cgroups --no-gpu-mask --socket "$S/sock" \
     --state-dir "$S/state" --dev-dir "$S/dev" --max-lifetime 1h &
 export HPC_BATCH_SOCKET="$S/sock"
 dispatch new -- echo hello
@@ -37,6 +37,7 @@ One root daemon, one unix socket, a thin client. Layered so the interesting part
 - `scheduling.py` — pure functions over the pool. **Policies reserve in the pool themselves**; the daemon only spawns what it is handed.
 - `jobs.py` — the `Job` dataclass shared by the queue, `state.json` and `info.json`. Converts itself to a `Request` and back to an `Allocation`.
 - `cgroup.py` — writes `cpuset.cpus`, `cpuset.mems`, `memory.max`. Enforcement only; it makes no decisions.
+- `devices.py` — masks the GPU device nodes a job was not allocated, in a mount namespace of its own. Enforcement only, like `cgroup.py`.
 - `daemon.py` — the only stateful actor: socket, queue, spawn, reap, persist, permissions. Every mutation of a `Job` goes through `_job_changed`, which rewrites `info.json` and marks state dirty; skip it and the on-disk view is stale until something else happens to persist.
 - `client.py` — thin.
 - `install.py` — picks the first of `util.ADMIN_GROUPS` that exists on the host and rewrites the systemd unit from the packaged template on *every* run, upgrades included. Reordering that tuple silently moves admin control over every job on a box that has both `wheel` and `sudo`. `install.json` in the prefix records what a run chose. `settle()` governs what `install()` does with it: an option not passed comes from the record rather than from the default, so `detect_admin_group()` cannot hand admin to a group that appeared on the box after the install, and an upgrade cannot relocate the entry points and orphan the old ones; an option passed with a different value is refused, because nothing here migrates an existing install. `uninstall()` deliberately does not settle — `bin_dirs_to_clean()` unions the recorded and requested directories, since cleanup wants every place a symlink might be.
@@ -55,7 +56,9 @@ One root daemon, one unix socket, a thin client. Layered so the interesting part
 
 **Every filesystem operation on a user-chosen path goes through `run_as_user`** (fork, drop privileges, report back over a pipe). The daemon is root; touching a user's path in-process lends them root's privileges. `drop_privileges` order — initgroups, setgid, setuid — is load-bearing and defined once.
 
-**The daemon owns `CUDA_VISIBLE_DEVICES`.** `_job_env` composes `defaults | job.env | ours` so a forwarded `--env` can never win: that variable is the whole of a job's GPU isolation. It is rendered by `format_id_list`, which also writes `cpuset.cpus` and `cpuset.mems` — cpuset accepts ranges (`0-3`) and `CUDA_VISIBLE_DEVICES` does not, so compressing them for the cgroup's benefit would quietly hide GPUs from every job.
+**The daemon owns `CUDA_VISIBLE_DEVICES`.** `_job_env` composes `defaults | job.env | ours` so a forwarded `--env` can never win. It is rendered by `format_id_list`, which also writes `cpuset.cpus` and `cpuset.mems` — cpuset accepts ranges (`0-3`) and `CUDA_VISIBLE_DEVICES` does not, so compressing them for the cgroup's benefit would quietly hide GPUs from every job.
+
+**The variable states the allocation; `devices.py` enforces it.** `CUDA_VISIBLE_DEVICES` says what a job's CUDA runtime *will* use, which is not what it *can* use: the job may rewrite it, and a container runtime told `--device nvidia.com/gpu=N` skips it entirely by injecting the node itself. So `preexec` also unshares a mount namespace and binds `/dev/null` over every `/dev/nvidiaN` outside the allocation, which works because the driver enumerates by probing those nodes — a masked card is invisible to NVML and to CUDA alike, and `nvidia-smi` inside a job agrees with what the job was given. Two things are load-bearing: it runs before `drop_privileges` (unsharing needs `CAP_SYS_ADMIN`), and it makes propagation private *before* the first bind, or the masks escape to the host and hide the GPUs from the whole machine. Only the per-card nodes are masked; `nvidiactl`, `nvidia-uvm`, `nvidia-uvm-tools` and `nvidia-modeset` name no card and every job needs them.
 
 **Reload is a re-exec, not a restart.** Anything added to `Job` must survive a round trip through `state.json`; `Job.from_dict` drops unknown keys and `_backfill_placement` fills in fields an older state file lacks.
 

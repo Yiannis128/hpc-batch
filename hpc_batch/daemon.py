@@ -33,6 +33,7 @@ from pathlib import Path
 
 from . import __version__
 from .cgroup import CgroupError, CgroupManager
+from .devices import GpuMaskError, check_supported, mask_foreign_gpus
 from .jobs import DONE, QUEUED, RUNNING, Job
 from .modify import FIELDS, ModError
 from .protocol import (
@@ -91,6 +92,7 @@ class Config:
     dev_dir: Path
     use_cgroups: bool
     use_dev_dir: bool
+    mask_gpus: bool
     schedule: str
     keep_finished: int
     reserve_cpu: int
@@ -352,6 +354,11 @@ class Daemon:
     def _setup_pool(self) -> None:
         nodes = discover_numa_nodes()
         gpus = discover_gpus()
+        if self.cfg.mask_gpus:
+            try:
+                check_supported(gpus)
+            except GpuMaskError as exc:
+                raise StartupError(str(exc)) from exc
         topology = discover_gpu_topology() if gpus else GpuTopology()
         node_mem = discover_node_memory_gb(nodes)
         # Memory is only confined to a node when we can actually write
@@ -678,6 +685,8 @@ class Daemon:
         def preexec() -> None:
             # Runs in the child, still as root, just before exec.
             self.cgroups.confine_current(cg, alloc.cpus)
+            if self.cfg.mask_gpus:
+                mask_foreign_gpus(alloc.gpus)
             drop_privileges(job.uid, pw.pw_gid, pw.pw_name)
             os.chdir(job.cwd)  # as the target user, so permissions apply
 
@@ -1170,6 +1179,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--no-dev-dir", dest="use_dev_dir", action="store_false",
         help="do not create the per-job inspection entries under --dev-dir",
+    )
+    parser.add_argument(
+        "--no-gpu-mask", dest="mask_gpus", action="store_false",
+        help="leave every GPU device node visible to every job. Without it a "
+             "job cannot open a card it was not allocated, whatever it does to "
+             "CUDA_VISIBLE_DEVICES and whatever devices it asks a container "
+             "runtime for",
     )
     parser.add_argument(
         "--schedule", choices=MODES, default=FIFO_STRICT, metavar="POLICY",

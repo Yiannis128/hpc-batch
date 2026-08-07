@@ -28,6 +28,7 @@ def make_config(tmp_path: Path, **kw) -> Config:
         dev_dir=tmp_path / "dev",
         use_cgroups=False,
         use_dev_dir=False,
+        mask_gpus=False,
         schedule="fifo-strict",
         keep_finished=50,
         reserve_cpu=2,
