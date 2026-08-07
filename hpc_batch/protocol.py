@@ -9,7 +9,7 @@ import asyncio
 import json
 import os
 
-DEFAULT_SOCKET = "/run/hpc-batch/hpc-batch.sock"
+from .util import DEFAULT_SOCKET
 
 # Generous cap on a single protocol line (command lines can be long).
 MAX_LINE = 1 << 20

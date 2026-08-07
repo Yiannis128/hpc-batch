@@ -18,13 +18,13 @@ from hpc_batch.install import (
     login_path_provides,
     profile_snippet,
     read_record,
-    remove_cgroup_tree,
     render_unit,
     safe_to_remove,
     settle,
     unit_template,
     write_record,
 )
+from hpc_batch.cgroup import CgroupManager
 from hpc_batch.util import ADMIN_GROUPS
 
 
@@ -212,28 +212,24 @@ class TestBinDirsToClean:
 class TestDaemonPaths:
     def test_falls_back_to_the_daemons_own_defaults(self):
         paths = daemon_paths("ExecStart=/opt/bin/hpc-batchd --max-lifetime 24h")
-        assert paths["state_dir"] == Path("/var/lib/hpc-batch")
-        assert paths["dev_dir"] == Path("/dev/hpc-batch")
-        assert paths["socket"] == Path("/run/hpc-batch/hpc-batch.sock")
-
-    def test_a_moved_state_dir_is_what_gets_purged(self):
-        # Purging the default here would report the data gone and leave it.
-        unit = "ExecStart=/opt/bin/hpc-batchd --state-dir /srv/hpc/state"
-        assert daemon_paths(unit)["state_dir"] == Path("/srv/hpc/state")
+        assert paths.state_dir == Path("/var/lib/hpc-batch")
+        assert paths.dev_dir == Path("/dev/hpc-batch")
+        assert paths.socket == Path("/run/hpc-batch/hpc-batch.sock")
 
     def test_reads_the_form_systemctl_show_prints(self):
         # `systemctl show -p ExecStart` is the source, not the unit file, so
-        # a drop-in from `systemctl edit` is not missed.
+        # a drop-in from `systemctl edit` is not missed. Purging the default
+        # state dir here would report the data gone and leave it on disk.
         shown = (
             "{ path=/opt/bin/hpc-batchd ; argv[]=/opt/bin/hpc-batchd "
             "--state-dir /srv/state --socket /run/x/y.sock ; ignore_errors=no }"
         )
         paths = daemon_paths(shown)
-        assert paths["state_dir"] == Path("/srv/state")
-        assert paths["socket"] == Path("/run/x/y.sock")
+        assert paths.state_dir == Path("/srv/state")
+        assert paths.socket == Path("/run/x/y.sock")
 
     def test_takes_an_equals_sign_too(self):
-        assert daemon_paths("--dev-dir=/dev/foo")["dev_dir"] == Path("/dev/foo")
+        assert daemon_paths("--dev-dir=/dev/foo").dev_dir == Path("/dev/foo")
 
 
 class TestSafeToRemove:
@@ -246,12 +242,12 @@ class TestSafeToRemove:
         assert not safe_to_remove(Path("/"))
 
 
-class TestRemoveCgroupTree:
+class TestDestroy:
     def test_removes_the_job_cgroups_and_the_root(self, tmp_path):
         root = tmp_path / "hpc-batch"
         (root / "job-1").mkdir(parents=True)
         (root / "job-2").mkdir()
-        assert remove_cgroup_tree(root) == []
+        assert CgroupManager(root=root).destroy() == []
         assert not root.exists()
 
     def test_reports_what_is_still_busy_instead_of_claiming_success(self, tmp_path):
@@ -261,11 +257,11 @@ class TestRemoveCgroupTree:
         busy = root / "job-1"
         busy.mkdir(parents=True)
         (busy / "tasks").write_text("")
-        assert remove_cgroup_tree(root, attempts=1, delay=0) == [busy]
+        assert CgroupManager(root=root).destroy(timeout=0) == [busy]
         assert root.exists()
 
     def test_a_machine_without_the_tree_has_nothing_to_do(self, tmp_path):
-        assert remove_cgroup_tree(tmp_path / "absent") == []
+        assert CgroupManager(root=tmp_path / "absent").destroy() == []
 
 
 def test_admin_group_candidates_cover_the_common_distros():
