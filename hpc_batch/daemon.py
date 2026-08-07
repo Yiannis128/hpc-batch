@@ -128,20 +128,23 @@ def run_as_user(uid: int, gid: int, user: str, fn) -> str | None:
     pid = os.fork()
     if pid == 0:  # child
         os.close(read_fd)
+        ok = False
         msg = ""
         try:
             drop_privileges(uid, gid, user)
             fn()
+            ok = True
         except BaseException as exc:
-            # BaseException rather than Exception: a SystemExit raised by fn
-            # would skip a narrower handler, and the exit below would then
-            # report success to the parent.
+            # Not Exception: SystemExit and KeyboardInterrupt are not one, and
+            # os._exit below runs from the finally either way. Setting `ok` at
+            # the end of the try rather than inferring it from `msg` is what
+            # keeps a narrowed handler from turning a failure into a success.
             msg = f"{type(exc).__name__}: {exc}"[:400]
         finally:
             with contextlib.suppress(OSError):
                 os.write(write_fd, msg.encode())
                 os.close(write_fd)
-            os._exit(1 if msg else 0)
+            os._exit(0 if ok else 1)
 
     os.close(write_fd)
     chunks = []
