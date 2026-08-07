@@ -3,7 +3,7 @@
 ## Commands
 
 ```sh
-hatch run test                                  # whole suite (~1s)
+hatch run test                                  # whole suite (~0.5s)
 hatch run test tests/test_resources.py -q       # one file
 hatch build && python scripts/check_wheel.py    # build; wheel must carry the systemd unit
 ```
@@ -32,10 +32,10 @@ Standard library only — `dependencies = []` is deliberate, so the install is a
 
 One root daemon, one unix socket, a thin client. Layered so the interesting parts are testable without root:
 
-- `protocol.py` — wire format (newline-delimited JSON) and the state/reason string constants. These are contract twice over: `dispatch list` prints `reason` verbatim, *and* both are persisted in `state.json`, so renaming one behind a client-side shim breaks re-adoption of running jobs across a restart. It holds the framing but neither transport, and must not import asyncio: `jobs.py`, `client.py` and the installer come here for the vocabulary and none of them runs an event loop, so `read_json`/`send_json` live in `daemon.py` and the client reads the same frames off a blocking socket. Putting an async helper back here puts asyncio in `dispatch`'s startup.
+- `protocol.py` — wire format (newline-delimited JSON) and the state/reason string constants. These are contract twice over: `dispatch list` prints `reason` verbatim, *and* both are persisted in `state.json`, so renaming one behind a client-side shim breaks re-adoption of running jobs across a restart. It holds the framing but neither transport, and must not import asyncio: `jobs.py`, `client.py` and the installer come here for the vocabulary and none of them runs an event loop, so the async `read_json`/`send_json` live in `daemon.py` and the client reads the same frames off a blocking socket. Putting an async helper back here puts asyncio in `dispatch`'s startup. `encode`/`decode` stay here because they are pure: both transports go through `decode`, so neither has to remember that a line which parses to a bare JSON value has no `.get`.
 - `resources.py` — machine discovery plus `ResourcePool`, the allocator. It has no idea what a job is; it takes a `Request` and returns an `Allocation`. Everything about NUMA placement, memory domains and GPU topology lives here.
 - `scheduling.py` — pure functions over the pool. **Policies reserve in the pool themselves**; the daemon only spawns what it is handed.
-- `jobs.py` — the `Job` dataclass shared by the queue, `state.json` and `info.json`. Converts itself to a `Request` and back to an `Allocation`. It also owns reading `state.json` (`read_state`, and `running_jobs` for the installer), so the daemon and `--purge` tolerate the same set of broken files, and `still_alive()`, the one place that decides a recorded pid is still its job — both callers SIGKILL a process group on the answer, so a state file too old to carry a starttime is answered no rather than guessed.
+- `jobs.py` — the `Job` dataclass shared by the queue, `state.json` and `info.json`. Converts itself to a `Request` and back to an `Allocation`. It also owns reading `state.json` (`read_state`), so the daemon and `--purge` tolerate the same set of broken files, and the pid pair: `attach_process()` writes `pid` and `proc_start` together and `still_alive()` is the one place that decides a recorded pid is still its job. Both of its callers SIGKILL a process group on the answer, so a state file too old to carry a starttime is answered no rather than guessed.
 - `cgroup.py` — writes `cpuset.cpus`, `cpuset.mems`, `memory.max`. Enforcement only; it makes no decisions. It owns the job-tree layout, so the two operations over the whole tree live here rather than in their callers: `prune()` reaps what a previous daemon left and spares anything still running, `destroy()` is the uninstaller's half and kills first.
 - `devices.py` — masks the GPU device nodes a job was not allocated, in a mount namespace of its own. Enforcement only, like `cgroup.py`.
 - `daemon.py` — the only stateful actor: socket, queue, spawn, reap, persist, permissions. Every mutation of a `Job` goes through `_job_changed`, which rewrites `info.json` and marks state dirty; skip it and the on-disk view is stale until something else happens to persist.

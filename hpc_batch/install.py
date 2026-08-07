@@ -30,7 +30,7 @@ from typing import NamedTuple
 
 from . import __version__
 from .cgroup import CgroupManager
-from .jobs import running_jobs
+from .jobs import RUNNING, StateError, read_state
 from .util import (
     ADMIN_GROUPS,
     DEFAULT_DEV_DIR,
@@ -245,9 +245,13 @@ def kill_running_jobs(state_dir: Path) -> list[int]:
     Under --no-cgroups there is no tree to walk, so these pids are the only
     handle on the jobs. Returns the ids actually killed.
     """
+    try:
+        _, jobs = read_state(state_dir)
+    except StateError:
+        return []  # a corrupt state file is one of the things a purge cleans up
     killed = []
-    for job in running_jobs(state_dir):
-        if not job.still_alive():
+    for job in jobs:
+        if job.state != RUNNING or not job.still_alive():
             continue
         try:
             os.killpg(job.pid, signal.SIGKILL)
@@ -262,8 +266,7 @@ def purge(paths: DaemonPaths) -> None:
     directory, the inspection entries and the socket."""
     killed = kill_running_jobs(paths.state_dir)
     if killed:
-        listed = ", ".join(str(i) for i in killed)
-        print(f"killed {len(killed)} running job(s): {listed}")
+        print(f"killed running jobs: {', '.join(str(i) for i in killed)}")
 
     cgroups = CgroupManager()
     busy = cgroups.destroy()

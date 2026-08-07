@@ -6,7 +6,6 @@ SO_PEERCRED, so there is nothing to configure client-side.
 
 import argparse
 import io
-import json
 import os
 import socket
 import sys
@@ -14,7 +13,7 @@ import time
 
 from . import __version__
 from .modify import FIELDS
-from .protocol import DONE, MAX_LINE, OOM, QUEUED, encode, socket_path
+from .protocol import DONE, MAX_LINE, OOM, QUEUED, decode, encode, socket_path
 from .resources import GPU_LINK_CHOICES, REMOTE_GPU_LINKS
 from .util import (
     duration_arg,
@@ -50,10 +49,9 @@ def _read_response(f: io.BufferedReader) -> dict:
         raise DispatchError("oversized response from daemon")
     if not line.endswith(b"\n"):
         raise DispatchError("daemon closed the connection unexpectedly")
-    try:
-        resp = json.loads(line)
-    except json.JSONDecodeError:
-        raise DispatchError("malformed response from daemon") from None
+    resp = decode(line)
+    if resp is None:
+        raise DispatchError("malformed response from daemon")
     if not resp.get("ok"):
         raise DispatchError(resp.get("error", "unknown daemon error"))
     return resp
