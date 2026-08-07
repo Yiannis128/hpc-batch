@@ -34,6 +34,16 @@ def encode(obj: dict) -> bytes:
     return json.dumps(obj).encode() + b"\n"
 
 
+def decode(line: bytes) -> dict | None:
+    """One frame back, or None if the line is not one. Both transports come
+    here, so neither has to remember that a bare JSON value has no `.get`."""
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
 def err(message: str) -> dict:
     """The protocol's error-response shape."""
     return {"ok": False, "error": message}

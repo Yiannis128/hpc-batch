@@ -30,7 +30,7 @@ from typing import NamedTuple
 
 from . import __version__
 from .cgroup import CgroupManager
-from .jobs import running_jobs
+from .jobs import RUNNING, StateError, read_state
 from .util import (
     ADMIN_GROUPS,
     DEFAULT_DEV_DIR,
@@ -253,8 +253,14 @@ def kill_running_jobs(state_dir: Path) -> KillOutcome:
     killed, what may still be running (unidentifiable, or a refused kill),
     and -- reported as neither -- what had simply ended already.
     """
+    try:
+        _, jobs = read_state(state_dir)
+    except StateError:
+        return KillOutcome([], [])  # a corrupt state file is itself something purge cleans up
     killed, unverified = [], []
-    for job in running_jobs(state_dir):
+    for job in jobs:
+        if job.state != RUNNING:
+            continue
         if not job.identifiable():
             unverified.append(job.id)
             continue
@@ -281,8 +287,7 @@ def purge(paths: DaemonPaths, cgroups: CgroupManager) -> bool:
     """
     killed, unverified = kill_running_jobs(paths.state_dir)
     if killed:
-        listed = ", ".join(str(i) for i in killed)
-        print(f"killed {len(killed)} running job(s): {listed}")
+        print(f"killed running jobs: {', '.join(str(i) for i in killed)}")
 
     clean = not unverified
     if unverified:

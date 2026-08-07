@@ -94,8 +94,6 @@ class TestProfileSnippet:
         script.write_text(
             f'PATH=/usr/bin\n. {snippet}\n. {snippet}\n. {snippet}\necho "$PATH"\n'
         )
-        import subprocess
-
         out = subprocess.run(
             ["sh", str(script)], capture_output=True, text=True, check=True
         ).stdout.strip()

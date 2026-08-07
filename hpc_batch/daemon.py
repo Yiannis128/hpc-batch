@@ -34,7 +34,7 @@ from pathlib import Path
 from . import __version__
 from .cgroup import CgroupError, CgroupManager
 from .devices import GpuMaskError, check_supported, gpu_nodes, mask_foreign_gpus, nodes_to_mask
-from .jobs import DONE, QUEUED, RUNNING, STATE_FILE_NAME, Job, StateError, proc_starttime, read_state
+from .jobs import DONE, QUEUED, RUNNING, Job, StateError, read_state, state_file
 from .modify import FIELDS, ModError
 from .protocol import (
     DEFAULT_SOCKET,
@@ -43,6 +43,7 @@ from .protocol import (
     MAX_LINE,
     OOM,
     TIMEOUT,
+    decode,
     encode,
     err,
 )
@@ -213,13 +214,7 @@ async def read_json(reader: asyncio.StreamReader) -> dict | None:
         line = await reader.readline()
     except (asyncio.LimitOverrunError, ValueError):
         return None
-    if not line:
-        return None
-    try:
-        obj = json.loads(line)
-    except json.JSONDecodeError:
-        return None
-    return obj if isinstance(obj, dict) else None
+    return decode(line) if line else None
 
 
 async def send_json(writer: asyncio.StreamWriter, obj: dict) -> None:
@@ -260,7 +255,7 @@ class Daemon:
 
     @property
     def state_file(self) -> Path:
-        return self.cfg.state_dir / STATE_FILE_NAME
+        return state_file(self.cfg.state_dir)
 
     # -- permissions -----------------------------------------------------
 
@@ -729,8 +724,7 @@ class Daemon:
 
         self._procs[job.id] = proc
         self._reserved.add(job.id)
-        job.pid = proc.pid
-        job.proc_start = proc_starttime(proc.pid)
+        job.attach_process(proc.pid)
         job.state = RUNNING
         job.start_time = time.time()
         job.cpus = list(alloc.cpus)
