@@ -76,9 +76,9 @@ log = logging.getLogger("hpc-batchd")
 TICK_S = 1.0
 KILL_GRACE_S = 10.0
 ATTACH_POLL_S = 0.3
-# A queued job's --env is held in the state file until it starts, so it has to
-# be bounded. Kept under MAX_LINE so an oversized one is rejected with a reason
-# instead of killing the connection.
+# A queued job's environment is held in the state file until it starts, so it
+# has to be bounded. Kept under MAX_LINE so an oversized one is rejected with a
+# reason instead of killing the connection.
 MAX_ENV_BYTES = 256 * 1024
 # EX_CONFIG. Paired with RestartPreventExitStatus= in the unit: a daemon that
 # is misconfigured will be just as misconfigured two seconds later, and a
@@ -188,7 +188,7 @@ def _gpu_note(gpus: list[int], link: str | None) -> str:
 
 
 def _env_problem(env) -> str | None:
-    """Why a submitted --env payload is unusable, or None if it is fine."""
+    """Why a submitted env payload is unusable, or None if it is fine."""
     if not isinstance(env, dict):
         return "env must be a mapping of strings to strings"
     size = 0

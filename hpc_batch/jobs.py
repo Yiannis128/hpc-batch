@@ -23,7 +23,8 @@ class Job:
     numa_local_mem: bool = False
     numa_local_gpu: bool = False
     min_gpu_link: str | None = None  # worst gpu link the job will accept
-    env: dict[str, str] = field(default_factory=dict)  # --env, dropped at start; {} = clean
+    # The client's environment overlay: --env, NAME=VALUE words, or both.
+    env: dict[str, str] = field(default_factory=dict)  # dropped at start; {} = clean
     mem_defaulted: bool = False  # budget assigned by us, not asked for
     state: str = QUEUED
     submit_time: float = 0.0

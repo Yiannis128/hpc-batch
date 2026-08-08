@@ -167,7 +167,8 @@ users cannot impersonate each other, and jobs run under the submitting user's
 uid and gid. Each job gets its own cgroup with `cpuset.cpus`, `cpuset.mems`
 and `memory.max` applied, living outside the daemon's own service cgroup so
 restarting the unit never disturbs a running job. A job gets a clean
-environment unless it passes `--env`; `CUDA_VISIBLE_DEVICES` is set by the
+environment unless it passes `--env` or names `NAME=VALUE` words before the
+command, which override the sweep; `CUDA_VISIBLE_DEVICES` is set by the
 daemon and a forwarded value never wins. The variable states the allocation
 and the daemon also enforces it, masking the device nodes of the cards a job
 did not get so that neither `nvidia-smi` nor a container asked for

@@ -154,15 +154,13 @@ class TestSplitAssignments:
         assert rest == ["/bin/echo", "hi"]
 
     def test_stops_at_the_command(self):
-        # Only leading words are environment: an argument that happens to look
-        # like an assignment belongs to the job.
         env, rest = split_assignments(["/bin/make", "CC=gcc"])
         assert env == {}
         assert rest == ["/bin/make", "CC=gcc"]
 
-    def test_paths_are_never_assignments(self):
-        for word in ["./x=y", "/usr/bin/x=y", "1FOO=bar", "-o=v"]:
-            assert split_assignments([word]) == ({}, [word])
+    @pytest.mark.parametrize("word", ["./x=y", "/usr/bin/x=y", "1FOO=bar", "-o=v"])
+    def test_paths_are_never_assignments(self, word):
+        assert split_assignments([word]) == ({}, [word])
 
     def test_empty_value(self):
         assert split_assignments(["FOO=", "/bin/true"]) == ({"FOO": ""}, ["/bin/true"])
