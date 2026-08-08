@@ -1,5 +1,6 @@
-"""Small shared helpers: duration parsing/formatting, table rendering, and
-the admin-group lookup the daemon and the installer have to agree on."""
+"""Small shared helpers: duration parsing/formatting, argv splitting, table
+rendering, and the admin-group lookup the daemon and the installer have to
+agree on."""
 
 import argparse
 import grp
@@ -66,14 +67,12 @@ def split_assignments(command: list[str]) -> tuple[dict[str, str], list[str]]:
     `./x=y` and `/usr/bin/x=y` stay part of the command.
     """
     env: dict[str, str] = {}
-    split = 0
-    for word in command:
+    for i, word in enumerate(command):
         if not _ASSIGNMENT.match(word):
-            break
+            return env, command[i:]
         name, _, value = word.partition("=")
         env[name] = value
-        split += 1
-    return env, command[split:]
+    return env, []
 
 
 def format_duration(seconds: float | None) -> str:

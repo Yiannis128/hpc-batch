@@ -188,7 +188,7 @@ def _gpu_note(gpus: list[int], link: str | None) -> str:
 
 
 def _env_problem(env) -> str | None:
-    """Why a submitted --env payload is unusable, or None if it is fine."""
+    """Why a submitted env payload is unusable, or None if it is fine."""
     if not isinstance(env, dict):
         return "env must be a mapping of strings to strings"
     size = 0
